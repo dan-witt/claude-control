@@ -1,0 +1,37 @@
+[project]
+name = "claude-control"
+version = "0.1.0"
+description = "Claude Code session daemon: hook intake, MCP session vocabulary, tmux TUI"
+readme = "README.md"
+authors = [
+    { name = "Daniel Witt", email = "12972868+dan-witt@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "starlette>=1.9.0",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+claude-control = "claude_control:main"
+
+[build-system]
+requires = ["uv_build>=0.11.0,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.16.0",
+    "pyright>=1.1.414",
+    "pytest>=9.1.1",
+    "ruff>=0.17.2",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+extend-select = ["I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

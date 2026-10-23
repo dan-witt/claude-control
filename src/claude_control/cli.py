@@ -1,0 +1,81 @@
+import argparse
+import json
+import logging
+import time
+from pathlib import Path
+
+from . import config, hooks_install, service_install
+from .store import EventStore
+
+
+def cmd_serve(args: argparse.Namespace, cfg: config.Config) -> None:
+    import uvicorn
+
+    from .app import create_app
+
+    store = EventStore(cfg.db_path)
+    app = create_app(store, retention_days=cfg.retention_days)
+    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level=args.log_level)
+
+
+def cmd_install_hooks(args: argparse.Namespace, cfg: config.Config) -> None:
+    path = args.settings or hooks_install.default_settings_path()
+    url = None if args.uninstall else cfg.hooks_url
+    changed, backup = hooks_install.write(path, url)
+    if not changed:
+        print(f"{path} unchanged")
+        return
+    action = "removed from" if url is None else f"pointing at {url} written to"
+    print(f"hooks {action} {path}" + (f" (backup: {backup})" if backup else ""))
+
+
+def cmd_install_service(args: argparse.Namespace, cfg: config.Config) -> None:
+    exe = service_install.executable()
+    path = service_install.install(exe, start=not args.no_start)
+    print(f"wrote {path} (ExecStart={exe} serve)")
+
+
+def cmd_events(args: argparse.Namespace, cfg: config.Config) -> None:
+    store = EventStore(cfg.db_path)
+    for e in store.recent(limit=args.limit, session_id=args.session):
+        if args.raw:
+            print(e.payload)
+            continue
+        stamp = time.strftime("%H:%M:%S", time.localtime(e.received_at))
+        payload = json.loads(e.payload)
+        detail = (
+            payload.get("notification_type")
+            or payload.get("tool_name")
+            or payload.get("source")
+            or payload.get("reason")
+            or ""
+        )
+        print(f"{stamp} {e.session_id} {e.tmux_pane or '-':>5} {e.event} {detail}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="claude-control")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("serve", help="run the daemon")
+    p.add_argument("--log-level", default="info")
+    p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("install-hooks", help="add HTTP hooks to Claude Code settings")
+    p.add_argument("--settings", type=Path)
+    p.add_argument("--uninstall", action="store_true")
+    p.set_defaults(func=cmd_install_hooks)
+
+    p = sub.add_parser("install-service", help="install and start the systemd user unit")
+    p.add_argument("--no-start", action="store_true")
+    p.set_defaults(func=cmd_install_service)
+
+    p = sub.add_parser("events", help="print recently received hook events")
+    p.add_argument("-n", "--limit", type=int, default=50)
+    p.add_argument("-s", "--session")
+    p.add_argument("--raw", action="store_true", help="print raw JSON payloads")
+    p.set_defaults(func=cmd_events)
+
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO)
+    args.func(args, config.load())
