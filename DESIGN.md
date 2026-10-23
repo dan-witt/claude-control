@@ -29,18 +29,27 @@ Out: calendar, tasks, the board UI, voice. No tool sends input to a session (no 
 
 Hooks are installed idempotently by `install-hooks` into `~/.claude/settings.json` (backup first; existing hooks such as peon-ping are left in place). All post the event JSON to `http://127.0.0.1:7777/hooks`:
 
-- `UserPromptSubmit`, `Notification`, `PermissionRequest`, `PreToolUse`, `PostToolUse`, `Stop`, `StopFailure`, `SessionEnd`: HTTP hooks, `timeout: 2`, header `"X-Tmux-Pane": "$TMUX_PANE"` (`allowedEnvVars: ["TMUX_PANE"]`).
-- `SessionStart`: a command hook running `curl`, because SessionStart accepts only `command` and `mcp_tool` hooks. It sends `X-Tmux-Pane` and `X-Claude-Pid: $PPID` (the claude process), and ends in `|| true` so a stopped daemon never fails the hook.
+- `UserPromptSubmit`, `Notification`, `PermissionRequest`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `StopFailure`, `SessionEnd`: HTTP hooks, `timeout: 1`, headers `"X-Tmux-Pane": "$TMUX_PANE"` and `"X-Claude-Socket": "$CLAUDE_CODE_MESSAGING_SOCKET"` (both in `allowedEnvVars`).
+- `SessionStart`: a command hook running `curl`, because SessionStart accepts only `command` and `mcp_tool` hooks. It sends `X-Tmux-Pane`, `X-Claude-Socket` and `X-Claude-Pid: $PPID` (the claude process), and ends in `|| true` so a stopped daemon never fails the hook.
 
-A failed HTTP hook is non-blocking in Claude Code, so a stopped daemon does not affect sessions. Running sessions pick up settings changes without a restart.
+`X-Claude-Socket` is the claude process's messaging socket path, unique per process. `SessionStart` pairs it with the pid; later events identify their process by it.
 
-Reconciliation: at startup and every 15s the daemon runs `claude agents --json` (documented CLI; the underlying `~/.claude/sessions/*.json` registry is undocumented and not read directly). This discovers sessions started before the daemon and marks sessions `ended` when their pid disappears (kill -9, closed terminal). Background (`--bg`) sessions are listed, view-only.
+A stopped daemon costs sessions nothing (connection refused is immediate; the UI shows a non-blocking "hook error"). A daemon that accepts connections but does not answer costs up to `timeout` per blocking hook: measured +7–8s on a short turn with one tool call at `timeout: 2`, hence `timeout: 1`. The request path must never block (no subprocess or slow I/O on the event loop). The daemon logs a warning when handling a `/hooks` request takes `timeout` or longer; time spent before the handler runs (a stalled event loop) is not measured.
+
+Running sessions pick up settings changes without a restart.
+
+Reconciliation: at startup and every 15s the daemon runs `claude agents --json` (documented CLI; ~0.12s wall, ~0.14s CPU per call). The underlying `~/.claude/sessions/*.json` registry is undocumented and not read directly; it keeps entries for killed processes. Reconciliation:
+- discovers sessions started before the daemon (they post nothing until their next prompt);
+- marks a process ended when its pid disappears (kill -9, a closed terminal that sent no `SessionEnd`);
+- reads each process's `status` (`busy`/`idle`). This is the only signal that a turn ended by interrupt or permission denial, which fire no hook.
+
+Background (`--bg`) sessions are listed, view-only.
 
 ## Session model
 
-- Primary key: `session_id`. Each session holds a set of attached processes `{pid, tmux_pane}`; in-memory maps `pid → session_id` and `pane → session_id` resolve lookups.
+- Primary key: `session_id`. Each session holds a set of attached processes `{socket, pid, tmux_pane}`; in-memory maps `socket → session_id`, `pid → session_id` and `pane → session_id` resolve lookups.
 - One `session_id` can have several processes: `claude --resume` of the same session in two terminals runs two pids with one id. `focus_session` picks the process with the most recent hook event.
-- `/clear`: the old `session_id` is marked `ended` (reason `clear`) and its pane moves to the new `session_id`.
+- `/clear` and in-session `/resume`: the old `session_id` gets `SessionEnd` (reason `clear` / `resume`) and the same process starts a new or other `session_id`; the process moves to it.
 
 States (stable names; may be revised after milestone 1 discovery):
 
@@ -48,12 +57,12 @@ States (stable names; may be revised after milestone 1 discovery):
 | --- | --- |
 | `starting` | `launch_session`, until `SessionStart` arrives; `error` with reason `launch_timeout` after ~15s |
 | `running` | `UserPromptSubmit`, or tool activity after a wait |
-| `waiting` | reason `permission` (`PermissionRequest`, `Notification` `permission_prompt`), `input` (`Notification` `idle_prompt` / `agent_needs_input` / elicitation), `done` (`Stop`) |
+| `waiting` | reason `permission` (`PermissionRequest`, `Notification` `permission_prompt`), `input` (`PermissionRequest` for `AskUserQuestion`, `Notification` `idle_prompt` / `agent_needs_input` / elicitation), `done` (`Stop`) |
 | `idle` | `waiting/done` with no event for 10 min |
 | `error` | `StopFailure` |
 | `ended` | `SessionEnd`, or pid gone at reconciliation |
 
-Activity: `PreToolUse` sets `current_tool` and increments a tool counter; `PostToolUse` clears `current_tool` and increments it. The TUI shows a spinner while `current_tool` is set or the counter changed in the last few seconds.
+Activity: `PreToolUse` sets `current_tool` and increments a tool counter; `PostToolUse` or `PostToolUseFailure` clears `current_tool` and increments it. The TUI shows a spinner while `current_tool` is set or the counter changed in the last few seconds.
 
 ## tmux
 
@@ -90,10 +99,37 @@ Rows in fixed order by start time (never re-sorted by urgency): name, shortened 
 
 ## Observed hook behaviour (Claude Code 2.1.309, 2026-10-23)
 
-From a test session in tmux with hooks pointed at a dev daemon:
+From test sessions in a separate tmux server (Haiku) with every documented hook event pointed at a dev daemon, plus real sessions on the live daemon. Raw payloads from the test runs are not kept; repeat with the harness described in `CLAUDE.md`.
 
-- `X-Tmux-Pane` resolves to the pane id (`%0`) on every HTTP hook. Requests arrive with `content-type: application/json` and `host: 127.0.0.1:<port>`.
-- `/clear` changes `session_id`: `SessionEnd` (reason `clear`) on the old id, then `SessionStart` (source `clear`) on a new id, same pane and process.
-- Permission flow: `PreToolUse` → `PermissionRequest` (same second) → `Notification` `permission_prompt` about 6s later → `PostToolUse` after approval. `PermissionRequest` is the prompt signal; `current_tool` is already set while waiting.
-- Subagent and background-agent tool calls fire `PreToolUse`/`PostToolUse` on the parent `session_id` with `agent_id` set, including after `Stop`. One such `PreToolUse` had no matching `PostToolUse` before `SessionEnd`.
-- `X-Claude-Pid` from the SessionStart command hook equals the claude process pid.
+| Case | Events observed | Consequence for the state machine |
+| --- | --- | --- |
+| Startup, prompt on the command line | `SessionStart` (source `startup`), `UserPromptSubmit` ~1.3s later | `claude "<prompt>"` submits the prompt; launch can rely on it |
+| Plain turn | `UserPromptSubmit` → `Stop`; often a `SubagentStop` with `agent_id` ~1s after `Stop` | Background agents keep posting after `Stop` |
+| Tool call | `PreToolUse` → `PostToolUse` → `PostToolBatch` | |
+| Bash exits non-zero | `PostToolUse` (not a failure) | |
+| Tool error (Read of a missing file) | `PreToolUse` → `PostToolUseFailure` | `PostToolUseFailure` must clear `current_tool` |
+| Three parallel Reads | Three sequential `Pre`/`Post` pairs, then one `PostToolBatch` | Pairs did not overlap |
+| Permission prompt | `PreToolUse` → `PermissionRequest` (same 20ms) → `Notification` `permission_prompt` ~6s later → `PostToolUse` on approval | `PermissionRequest` is the prompt signal; `current_tool` is set while waiting |
+| `AskUserQuestion` | `PreToolUse` → `PermissionRequest` with `tool_name: AskUserQuestion` → `permission_prompt` ~6s later → `PostToolUse` on answer | Reason `input`, distinguished by tool name |
+| Plan approval | `PreToolUse` → `PermissionRequest` with `tool_name: ExitPlanMode` → `permission_prompt` ~6s later | Reason `permission` (or a distinct `plan`) by tool name |
+| Esc while a tool runs | `PreToolUse`, then nothing: no `Post*`, no `Stop`, no `idle_prompt` after 11 min | Only reconciliation `status: idle` shows the turn ended |
+| Esc or "No" at a permission prompt | `PreToolUse` → `PermissionRequest`, then nothing; `idle_prompt` ~61s later | Same; `idle_prompt` arrives in this case only |
+| Turn finished, no input | `Notification` `idle_prompt` 61s after `Stop` | |
+| API error (stub returning 400) | `UserPromptSubmit` → `StopFailure` (`error: "unknown"`, `last_assistant_message: "API Error: 400 …"`); no `Stop` | `error` state |
+| `/clear` | `SessionEnd` (reason `clear`) old id → `SessionStart` (source `clear`) new id; same pid, pane, socket | |
+| `/compact` | `PreCompact` → `SessionStart` (source `compact`, same id) → `PostCompact`, ~10s | No `UserPromptSubmit`/`Stop` around it |
+| `/resume <id>` inside a session | `SessionEnd` (reason `resume`) old id → `SessionStart` (source `resume`) on `<id>`; same pid, pane | The target id can now have two processes |
+| `--resume <id> --fork-session` | `SessionStart` (source `fork`) on a new id | |
+| `--resume` of one session in two terminals | Two `SessionStart` (source `resume`), same id, different `X-Claude-Pid` and socket | Per-process state needs the socket header |
+| `-p` | `SessionStart`/`SessionEnd` and tool events with pid and socket, no pane; listed by `claude agents --json` as `interactive` while running | Tracked like any session; reconciliation does not drop it early |
+| `--bg` | Same as `-p`; `--settings` is honoured; `claude agents` showed `busy`/`working` after `Stop`; `claude stop` → `SessionEnd` (reason `other`) | `status` from `claude agents` can lag hooks |
+| Terminal closed (`tmux kill-session`/`kill-server`) | `SessionEnd` (reason `other`) for sessions that had a turn; none for one that never submitted a prompt | Reconciliation still needed |
+| kill -9 (pid 31520) | Nothing. `~/.claude/sessions/31520.json` stays on disk with `status: "idle"`; `claude agents --json` omits the pid immediately | Use the CLI, not the registry files |
+| `SessionEnd` headers | `X-Claude-Socket` is empty on `SessionEnd` from exit or closed terminal (present on `/resume`) | Match `SessionEnd` by `session_id` + pane; reconciliation covers the rest |
+| Hook-driven MCP calls | A plugin's hook-driven MCP call at session start fired `PreToolUse` + `PermissionRequest` (first with `prompt_id: null`) with no `Post*`, in a `-p` session | A `PermissionRequest` is not always a visible prompt |
+| Blocked tool call | Claude Code's built-in guard rejected `sleep 45` before any `PreToolUse` | |
+| Background task completion | Starts a new turn: `UserPromptSubmit` → `Stop` | |
+| Daemon frozen (SIGSTOP) | Short turn 2.5–4s → 10.8–11.8s. Requests queued in the socket were processed on resume with that time as `received_at` | Never block the request path; `received_at` is arrival, not event time |
+| Daemon stopped | No slowdown; events lost; UI shows "Stop hook error occurred" | |
+
+Request details: `content-type: application/json`, `host: 127.0.0.1:<port>`, `user-agent: axios/…`. `X-Tmux-Pane` resolves on every hook; `X-Claude-Pid` equals the claude pid; `claude agents --json` names are per process and change on resume (`live-b0` → `live-b4`, `live-8c`).

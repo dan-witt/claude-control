@@ -14,12 +14,13 @@ EVENTS = [
     "PermissionRequest",
     "PreToolUse",
     "PostToolUse",
+    "PostToolUseFailure",
     "Stop",
     "StopFailure",
     "SessionEnd",
 ]
 
-TIMEOUT_S = 2
+TIMEOUT_S = 1
 
 
 def default_settings_path() -> Path:
@@ -32,15 +33,21 @@ def hook_entry(event: str, url: str) -> dict:
         command = (
             f"curl -s -m {TIMEOUT_S} -o /dev/null -H 'Content-Type: application/json'"
             ' -H "X-Tmux-Pane: $TMUX_PANE" -H "X-Claude-Pid: $PPID"'
+            ' -H "X-Claude-Socket: $CLAUDE_CODE_MESSAGING_SOCKET"'
             f" --data-binary @- {shlex.quote(url)} || true"
         )
         return {"type": "command", "command": command, "timeout": TIMEOUT_S + 1}
+    # The messaging socket path is unique per claude process; it tells apart two
+    # processes resumed on the same session_id outside tmux.
     return {
         "type": "http",
         "url": url,
         "timeout": TIMEOUT_S,
-        "headers": {"X-Tmux-Pane": "$TMUX_PANE"},
-        "allowedEnvVars": ["TMUX_PANE"],
+        "headers": {
+            "X-Tmux-Pane": "$TMUX_PANE",
+            "X-Claude-Socket": "$CLAUDE_CODE_MESSAGING_SOCKET",
+        },
+        "allowedEnvVars": ["TMUX_PANE", "CLAUDE_CODE_MESSAGING_SOCKET"],
     }
 
 

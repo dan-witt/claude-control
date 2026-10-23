@@ -72,3 +72,16 @@ def test_prune(store):
     store.append("{}", "new", "Stop", None, {}, received_at=300.0)
     assert store.prune(200.0) == 1
     assert [e.session_id for e in store.recent()] == ["new"]
+
+
+def test_warns_when_handling_reaches_hook_timeout(store, caplog):
+    with TestClient(create_app(store, slow_after_s=0), base_url="http://127.0.0.1:7777") as c:
+        post(c, {"session_id": "s1", "hook_event_name": "Stop"})
+    [record] = [r for r in caplog.records if r.name == "claude_control.app"]
+    assert record.levelname == "WARNING"
+    assert "Stop" in record.getMessage() and "s1" in record.getMessage()
+
+
+def test_no_warning_for_fast_request(client, caplog):
+    post(client, {"session_id": "s1", "hook_event_name": "Stop"})
+    assert not [r for r in caplog.records if r.name == "claude_control.app"]

@@ -30,7 +30,11 @@ def test_session_start_is_a_command_hook():
     entry = hooks_install.hook_entry("SessionStart", URL)
     assert entry["type"] == "command"
     assert URL in entry["command"]
-    assert hooks_install.hook_entry("Stop", URL)["type"] == "http"
+    stop = hooks_install.hook_entry("Stop", URL)
+    assert stop["type"] == "http"
+    # Every header variable must be allowlisted or Claude Code sends it empty.
+    for value in stop["headers"].values():
+        assert value.removeprefix("$") in stop["allowedEnvVars"]
 
 
 def test_session_start_command_posts_stdin(tmp_path):
@@ -45,11 +49,17 @@ def test_session_start_command_posts_stdin(tmp_path):
     subprocess.run(
         ["sh", "-c", command],
         input=b'{"x":1}',
-        env={"PATH": f"{tmp_path}:/usr/bin:/bin", "OUT": str(out), "TMUX_PANE": "%7"},
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "OUT": str(out),
+            "TMUX_PANE": "%7",
+            "CLAUDE_CODE_MESSAGING_SOCKET": "/run/user/1000/cc-socks/42.sock",
+        },
         check=True,
     )
     argv = out.read_text().splitlines()
     assert "X-Tmux-Pane: %7" in argv
+    assert "X-Claude-Socket: /run/user/1000/cc-socks/42.sock" in argv
     assert any(a.startswith("X-Claude-Pid: ") and a[14:].isdigit() for a in argv)
     assert argv[-1] == URL
     assert (tmp_path / "argv.body").read_text() == '{"x":1}'
