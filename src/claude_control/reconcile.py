@@ -50,25 +50,6 @@ async def list_agents(claude_bin: str) -> list[Agent] | None:
     return [a for a in (Agent.from_json(r) for r in rows if isinstance(r, dict)) if a]
 
 
-async def pane_pids() -> dict[int, str]:
-    """pane_pid -> pane id for every pane of the default tmux server; empty if none runs.
-
-    `list-panes` does not start a server.
-    """
-    try:
-        code, out, _ = await _run("tmux", "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}")
-    except (OSError, TimeoutError):
-        return {}
-    if code != 0:
-        return {}
-    panes = {}
-    for line in out.decode().splitlines():
-        pid, _, pane = line.partition(" ")
-        if pid.isdigit() and pane:
-            panes[int(pid)] = pane
-    return panes
-
-
 def parent_pid(pid: int) -> int | None:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()

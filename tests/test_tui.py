@@ -6,7 +6,16 @@ import pytest
 from textual.widgets import DataTable
 
 from claude_control import tmux
-from claude_control.tui import FocusFailed, SessionsApp, age, describe, short_cwd
+from claude_control.tui import (
+    FocusFailed,
+    LaunchFailed,
+    LaunchScreen,
+    PathSuggester,
+    SessionsApp,
+    age,
+    describe,
+    short_cwd,
+)
 
 
 def row(sid, name, state, reason=None, **kw):
@@ -25,11 +34,13 @@ def row(sid, name, state, reason=None, **kw):
 
 
 class FakeBackend:
-    def __init__(self, rows, ended=(), focus_error=None):
+    def __init__(self, rows, ended=(), focus_error=None, launch_error=None):
         self.rows = rows
         self.ended = list(ended)
         self.focus_error = focus_error
+        self.launch_error = launch_error
         self.focused: list[str] = []
+        self.launched: list[tuple] = []
         self.include_ended_calls: list[bool] = []
         self.on_change = None
 
@@ -49,6 +60,12 @@ class FakeBackend:
         self.focused.append(session_id)
         if self.focus_error:
             raise FocusFailed(self.focus_error)
+
+    async def launch(self, cwd, prompt, name):
+        self.launched.append((cwd, prompt, name))
+        if self.launch_error:
+            raise LaunchFailed(self.launch_error)
+        return {"session_id": "new", "name": name or "made-up", "state": "starting"}
 
 
 ROWS = [
@@ -227,3 +244,55 @@ def test_ensure_window_creates_session_then_window(tmux_socket):
     ran = tmux.ensure_window("claude", "tui", ["sleep", "60"], socket=tmux_socket)
     assert ran[0][3] == "new-window"
     assert sorted(windows(tmux_socket, "claude")) == ["tui", "work"]
+
+
+@pytest.mark.anyio
+async def test_new_session_dialog_launches():
+    backend = FakeBackend(ROWS)
+    app = SessionsApp(backend.factory(), poll_s=5)
+    async with app.run_test(notifications=True) as pilot:
+        await pilot.pause(0.1)
+        await pilot.press("j", "n")  # beta selected: its directory is the default
+        await pilot.pause(0.1)
+        assert isinstance(app.screen, LaunchScreen)
+        await pilot.press("enter")  # directory -> name
+        await pilot.press(*"job", "enter")  # name -> prompt
+        await pilot.press(*"line one", "enter", *"line two")
+        await pilot.press("ctrl+s")
+        await pilot.pause(0.1)
+        assert not isinstance(app.screen, LaunchScreen)
+        messages = [n.message for n in app._notifications]
+    assert backend.launched == [("/w/beta", "line one\nline two", "job")]
+    assert messages == ["launched job"]
+
+
+@pytest.mark.anyio
+async def test_new_session_dialog_shows_error_and_stays_open():
+    backend = FakeBackend(ROWS, launch_error="no such directory: /nope")
+    app = SessionsApp(backend.factory(), poll_s=5)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        await pilot.press("n")
+        await pilot.pause(0.1)
+        await pilot.press("ctrl+s")
+        await pilot.pause(0.1)
+        assert isinstance(app.screen, LaunchScreen)
+        assert "no such directory" in str(app.screen.query_one("#error").render())
+        await pilot.press("escape")
+        await pilot.pause(0.1)
+        assert not isinstance(app.screen, LaunchScreen)
+    assert backend.launched == [("/w/alpha", None, None)]
+
+
+@pytest.mark.anyio
+async def test_path_suggester(tmp_path, monkeypatch):
+    for d in ("alpha", "alps", ".hidden"):
+        (tmp_path / d).mkdir()
+    (tmp_path / "afile").write_text("")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sug = PathSuggester()
+    assert await sug.get_suggestion(f"{tmp_path}/al") == f"{tmp_path}/alpha/"
+    assert await sug.get_suggestion("~/alp") == "~/alpha/"
+    assert await sug.get_suggestion("~/af") is None  # files are not suggested
+    assert await sug.get_suggestion("~/.h") == "~/.hidden/"
+    assert await sug.get_suggestion("~/zz") is None

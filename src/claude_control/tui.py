@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import os
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -14,7 +15,10 @@ from mcp.types import TextContent
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
-from textual.widgets import DataTable, Footer, Input
+from textual.containers import Vertical
+from textual.screen import ModalScreen
+from textual.suggester import Suggester
+from textual.widgets import DataTable, Footer, Input, Label, TextArea
 
 from .mcp_server import SESSIONS_URI, STATES
 
@@ -47,6 +51,8 @@ WORDS = {
     "SessionStart clear": "cleared",
     "SessionStart compact": "compacted",
     "SessionStart fork": "forked",
+    "launched": "launching",
+    "waiting at startup": "waiting at startup (folder trust?)",
 }
 
 
@@ -105,10 +111,16 @@ class FocusFailed(Exception):
     pass
 
 
+class LaunchFailed(Exception):
+    pass
+
+
 class Backend(Protocol):
     async def sessions(self, include_ended: bool) -> list[dict[str, Any]]: ...
 
     async def focus(self, session_id: str) -> None: ...
+
+    async def launch(self, cwd: str, prompt: str | None, name: str | None) -> dict[str, Any]: ...
 
 
 # Opens a backend; the callable it is given is invoked whenever the daemon reports a change.
@@ -133,6 +145,18 @@ class McpBackend:
         result = await self.client.call_tool("focus_session", {"session_id": session_id})
         if result.is_error:
             raise FocusFailed(_text(result))
+
+    async def launch(self, cwd: str, prompt: str | None, name: str | None) -> dict[str, Any]:
+        args: dict[str, Any] = {"cwd": cwd}
+        if prompt:
+            args["prompt"] = prompt
+        if name:
+            args["name"] = name
+        result = await self.client.call_tool("launch_session", args)
+        if result.is_error:
+            raise LaunchFailed(_text(result))
+        data = result.structured_content
+        return data if isinstance(data, dict) else {}
 
 
 def _text(result: Any) -> str:
@@ -162,6 +186,94 @@ def mcp_backend(url: str, token: str) -> BackendFactory:
     return connect
 
 
+class PathSuggester(Suggester):
+    """Completes the next directory component of a path."""
+
+    def __init__(self) -> None:
+        super().__init__(use_cache=False, case_sensitive=True)
+
+    async def get_suggestion(self, value: str) -> str | None:
+        if not value:
+            return None
+        expanded = os.path.expanduser(value)
+        head, tail = os.path.split(expanded)
+        try:
+            names = sorted(os.listdir(head or "."))
+        except OSError:
+            return None
+        for name in names:
+            hidden = name.startswith(".") and not tail.startswith(".")
+            if name.startswith(tail) and not hidden and os.path.isdir(os.path.join(head, name)):
+                completed = os.path.join(head, name) + "/"
+                return value + completed[len(expanded) :] if completed != expanded else None
+        return None
+
+
+class LaunchScreen(ModalScreen[dict[str, Any] | None]):
+    """New session: directory, optional name, optional multi-line prompt."""
+
+    CSS = """
+    LaunchScreen { align: center middle; }
+    #dialog { width: 90; height: auto; padding: 1 2; border: round $accent; background: $surface; }
+    #prompt { height: 8; }
+    #error { color: $error; height: auto; }
+    Label { margin-top: 1; }
+    """
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("ctrl+s", "launch", "launch", priority=True),
+        Binding("escape", "cancel", "cancel"),
+    ]
+
+    def __init__(self, backend: Backend, cwd: str):
+        super().__init__()
+        self.backend = backend
+        self.default_cwd = cwd
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("New session — ctrl+s launches, esc cancels")
+            yield Label("directory  (→ accepts a completion)")
+            yield Input(self.default_cwd, id="cwd", suggester=PathSuggester())
+            yield Label("name  (optional)")
+            yield Input(placeholder="directory name plus two hex digits", id="name")
+            yield Label("prompt  (optional)")
+            yield TextArea(id="prompt", tab_behavior="focus")
+            yield Label("", id="error")
+            yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#cwd", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self.focus_next()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        event.stop()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    async def action_launch(self) -> None:
+        cwd = self.query_one("#cwd", Input).value.strip()
+        name = self.query_one("#name", Input).value.strip() or None
+        prompt = self.query_one("#prompt", TextArea).text.strip() or None
+        error = self.query_one("#error", Label)
+        if not cwd:
+            error.update("a directory is required")
+            return
+        try:
+            result = await self.backend.launch(cwd, prompt, name)
+        except LaunchFailed as e:
+            error.update(str(e))
+            return
+        self.dismiss(result)
+
+
+class SessionTable(DataTable):
+    BINDINGS: ClassVar[list[BindingType]] = [Binding("enter", "app.focus_session", "focus")]
+
+
 class FilterInput(Input):
     BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "app.clear_filter", "clear filter")]
 
@@ -176,9 +288,8 @@ class SessionsApp(App):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("j", "cursor_down", "down", show=False),
         Binding("k", "cursor_up", "up", show=False),
-        # priority: the table would otherwise take Enter and the footer would not show it
-        Binding("enter", "focus_session", "focus", priority=True),
         Binding("slash", "show_filter", "filter"),
+        Binding("n", "new_session", "new"),
         Binding("e", "toggle_ended", "ended"),
         Binding("q", "quit", "quit"),
     ]
@@ -193,17 +304,19 @@ class SessionsApp(App):
         self.include_ended = False
         self.filter = ""
         self.disconnected = False
+        self.table = SessionTable(cursor_type="row", zebra_stripes=True)
+        self.filter_box = FilterInput(placeholder="filter: name, directory or state", id="filter")
         self.wake = asyncio.Event()
         # session_id -> (tool_count, time it last changed)
         self.activity: dict[str, tuple[int, float]] = {}
 
     def compose(self) -> ComposeResult:
-        yield FilterInput(placeholder="filter: name, directory or state", id="filter")
-        yield DataTable(cursor_type="row", zebra_stripes=True)
+        yield self.filter_box
+        yield self.table
         yield Footer()
 
     def on_mount(self) -> None:
-        table = self.query_one(DataTable)
+        table = self.table
         table.add_column(" ", key="act", width=1)
         table.add_column("session", key="name")
         table.add_column("directory", key="cwd")
@@ -276,7 +389,7 @@ class SessionsApp(App):
         return now - changed_at < ACTIVE_FOR_S
 
     def render_rows(self) -> None:
-        table = self.query_one(DataTable)
+        table = self.table
         selected = self.selected_id()
         table.clear()
         now = time.monotonic()
@@ -300,7 +413,9 @@ class SessionsApp(App):
         return SPINNER[int(now * 8) % len(SPINNER)]
 
     def tick(self) -> None:
-        table = self.query_one(DataTable)
+        if not self.table.is_mounted:
+            return
+        table = self.table
         now = time.monotonic()
         since_fetch = now - self.fetched_at
         for r in self.visible_rows():
@@ -310,7 +425,7 @@ class SessionsApp(App):
                 table.update_cell(key, "age", age(r.get("last_event_age_s", 0) + since_fetch))
 
     def selected_id(self) -> str | None:
-        table = self.query_one(DataTable)
+        table = self.table
         if table.row_count == 0:
             return None
         row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
@@ -319,18 +434,12 @@ class SessionsApp(App):
     # --- actions
 
     def action_cursor_down(self) -> None:
-        self.query_one(DataTable).action_cursor_down()
+        self.table.action_cursor_down()
 
     def action_cursor_up(self) -> None:
-        self.query_one(DataTable).action_cursor_up()
+        self.table.action_cursor_up()
 
     def action_focus_session(self) -> None:
-        box = self.query_one("#filter", Input)
-        if box.has_focus:
-            if not self.filter:
-                box.remove_class("shown")
-            self.query_one(DataTable).focus()
-            return
         session_id = self.selected_id()
         if session_id is None:
             return
@@ -345,23 +454,46 @@ class SessionsApp(App):
         except FocusFailed as e:
             self.notify(str(e), severity="error")
 
+    def action_new_session(self) -> None:
+        if self.backend is None:
+            self.notify("not connected to the daemon", severity="error")
+            return
+        selected = next((r for r in self.rows if r["session_id"] == self.selected_id()), None)
+        cwd = (selected or {}).get("cwd") or os.path.expanduser("~")
+
+        def launched(result: dict[str, Any] | None) -> None:
+            if result:
+                self.notify(f"launched {result.get('name')}")
+                self.wake.set()
+
+        self.push_screen(LaunchScreen(self.backend, cwd), launched)
+
     def action_toggle_ended(self) -> None:
         self.include_ended = not self.include_ended
         self.wake.set()
 
     def action_show_filter(self) -> None:
-        box = self.query_one("#filter", Input)
+        box = self.filter_box
         box.add_class("shown")
         box.focus()
 
     def action_clear_filter(self) -> None:
-        box = self.query_one("#filter", Input)
+        box = self.filter_box
         box.value = ""
         self.filter = ""
         box.remove_class("shown")
-        self.query_one(DataTable).focus()
+        self.table.focus()
         self.render_rows()
 
     def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input is not self.filter_box:
+            return
         self.filter = event.value
         self.render_rows()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input is not self.filter_box:
+            return
+        if not self.filter:
+            self.filter_box.remove_class("shown")
+        self.table.focus()

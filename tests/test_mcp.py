@@ -15,6 +15,7 @@ from mcp.types import TextContent, TextResourceContents
 from claude_control import mcp_server, tmux
 from claude_control.app import create_app
 from claude_control.events import Event
+from claude_control.launch import LaunchError
 from claude_control.state import Agent, Tracker
 from claude_control.store import EventStore
 
@@ -90,7 +91,7 @@ def structured(result):
 async def test_tools_are_listed(tracker):
     async with Client(server(tracker)) as c:
         names = {t.name for t in (await c.list_tools()).tools}
-    assert names == {"list_sessions", "get_session", "focus_session"}
+    assert names == {"list_sessions", "get_session", "focus_session", "launch_session"}
 
 
 @pytest.mark.anyio
@@ -247,3 +248,21 @@ async def test_subscriber_is_notified_when_a_hook_changes_state(daemon):
             with anyio.fail_after(5):
                 event = await sub.__anext__()
     assert event == ResourceUpdated(uri=mcp_server.SESSIONS_URI)
+
+
+@pytest.mark.anyio
+async def test_launch_session_tool(tracker):
+    calls = []
+
+    async def launch(cwd, prompt, name):
+        calls.append((cwd, prompt, name))
+        if cwd == "/bad":
+            raise LaunchError("no such directory: /bad")
+        return {"session_id": "new-1", "name": "x-1", "pane": "%5", "state": "starting"}
+
+    srv = mcp_server.build(tracker, InMemorySubscriptionBus(), FakeFocus(), launch)
+    ok = structured(await call(srv, "launch_session", cwd="/w", prompt="hi"))
+    assert ok["session_id"] == "new-1"
+    bad = await call(srv, "launch_session", cwd="/bad")
+    assert bad.is_error and "no such directory" in text(bad)
+    assert calls == [("/w", "hi", None), ("/bad", None, None)]

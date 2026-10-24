@@ -67,7 +67,7 @@ States follow the main agent only; events with an `agent_id` update background a
 
 | State | Set by |
 | --- | --- |
-| `starting` | `launch_session`, until `SessionStart` arrives; `error` with reason `launch_timeout` after ~15s |
+| `starting` | `launch_session`, until the session's first hook event. After 15s without one, the daemon looks for a process started with `--session-id <id>`: running → `waiting/input` (last event `waiting at startup`; the folder-trust prompt blocks `SessionStart`, and `claude agents` does not list the process until it is answered); not running → `ended/launch_failed`. Reconciliation does not end a launched session before that check. |
 | `idle` (new) | `SessionStart` of a new session, which sits at an empty prompt; `compact` and a second `resume` of a live session keep the state |
 | `running` | `UserPromptSubmit` (typed, queued mid-turn, or a `<task-notification>`; no `Stop` need precede it), or main-agent tool activity after a wait |
 | `waiting` | reason `permission` (`PermissionRequest`, including `ExitPlanMode`), `input` (`PermissionRequest` for `AskUserQuestion`, `Notification` `agent_needs_input` / `elicitation_dialog`), `done` (`Stop`). `Notification` `permission_prompt` changes nothing. `Notification` `idle_prompt` is not sent while a prompt is open, so it moves `running` (interrupted turn) and `waiting/permission`/`input` (dismissed prompt) to `waiting/done` and clears open tool calls. |
@@ -88,7 +88,7 @@ Activity: main-agent tool calls are tracked as a set of open `tool_use_id`s (`Pr
 - tmux is the session host. Sessions outside tmux are tracked and listed but cannot be focused.
 - Launched sessions go into a dedicated tmux session `claude`, one window per Claude session named after it, the TUI in a window named `tui`.
 - The daemon never owns the tmux server. Whoever starts the server (the `tui` command now, the daemon for `launch_session`) starts it in its own scope: `systemd-run --user --scope --unit=claude-tmux tmux new-session -d -s claude ...`. A server started inside the daemon's cgroup would be killed, with every Claude session, on `systemctl --user restart claude-control`. Verified: the server's cgroup is `app.slice/claude-tmux.scope`, and the scope goes away with the server.
-- A launched window runs `bash -li` in `cwd`; the daemon then types `claude --session-id <uuid> --name <name> "<prompt>"` into it. Claude gets the full `.bashrc` environment (nvm, pyenv, bun), and the pane is left at a shell when Claude exits.
+- A launched window (`new-window -d`, so no client moves to it) runs `bash -li` in `cwd`; the daemon registers the session as `starting`, then types `claude --session-id <uuid> --name <name> [launch_args] $'<prompt>'` into it. The prompt is quoted as one bash `$'...'` word, so a multi-line prompt types as a single line. Claude gets the full `.bashrc` environment (nvm, pyenv, bun), and the pane is left at a shell when Claude exits. `launch_args` (config) adds fixed arguments such as a model; the tool takes no free-form arguments.
 - Focus: `tmux switch-client` on the most recently active client to the session's pane. No attached client → error. With tmux 3.4, `switch-client -c <client> -t <pane id>` selects the pane's session, window and pane in one step. The way back to the TUI is a tmux binding documented in the README (`bind C-c switch-client -t claude:tui`); the tool does not edit `~/.tmux.conf`.
 
 ## MCP vocabulary (v1)
@@ -98,9 +98,9 @@ Activity: main-agent tool calls are tracked as a set of open `tool_use_id`s (`Pr
 | `list_sessions(states?)` | Sessions oldest first: `session_id`, `name`, `state`, `reason`, `cwd`, `last_event`, `last_event_age_s`, `started_at`, `pane`, `current_tool`, `tool_count`, `background_tasks`. Without `states`, every session that has not ended; an unknown state name is an error. |
 | `get_session(session_id)` | One session: the list fields plus `message` (last assistant message or notification text), `permission_tool`, `processes` (pid, pane), `tasks` (open background tasks), `ended_at` |
 | `focus_session(session_id)` | `tmux switch-client -c <client> -t <pane>` on the client with the latest `client_activity`, to the pane of the session's most recently active process. Errors: session ended, not in tmux, no client attached. |
-| `launch_session(cwd, prompt?, name?)` | New window in the `claude` tmux session; returns the pre-assigned `session_id` in state `starting`. `cwd` must exist; `name` defaults to the cwd basename plus a short suffix. No free-form CLI arguments. |
+| `launch_session(cwd, prompt?, name?)` | New window in the `claude` tmux session (created, with its server in its own scope, if missing); returns `session_id`, `name`, `pane` and `state: starting`. `cwd` must be an existing absolute directory (`~` expands); `name` defaults to the cwd basename plus two hex digits and must not match a live session. No free-form CLI arguments. |
 
-`session_id` arguments accept the full id, a session's name (from `claude agents`), or a unique id prefix of at least 4 characters. `launch_session` arrives with milestone 5.
+`session_id` arguments accept the full id, a session's name (from `claude agents`), or a unique id prefix of at least 4 characters.
 
 Resource: `sessions://`, JSON of `list_sessions()`. Subscribers are notified (`ResourceUpdated`) when a session is added or removed or its state, reason, name or processes change; tool activity does not notify. Notifications use the 2026-07-28 `subscriptions/listen` stream; clients on earlier protocol versions (`resources/subscribe`) can read the resource but get no notifications.
 
@@ -110,7 +110,7 @@ Resource: `sessions://`, JSON of `list_sessions()`. Subscribers are notified (`R
 
 The TUI is an MCP client of the daemon (`list_sessions`, `focus_session`). It refreshes on `sessions://` notifications and polls every second for tool activity and ages; when the daemon is unreachable it shows one notification and retries.
 
-Rows in fixed order by start time (never re-sorted by urgency): activity spinner (a main-agent tool call is open, or `tool_count` changed in the last 3s), name, shortened cwd, state badge with reason, last event in words, age of the last event. Keys: `j`/`k` move, `enter` focus, `/` filter (name, directory, state; `escape` clears), `e` toggle ended sessions (hidden by default), `q` quit. `n` new session (cwd with path completion, multi-line prompt) comes with milestone 5.
+Rows in fixed order by start time (never re-sorted by urgency): activity spinner (a main-agent tool call is open, or `tool_count` changed in the last 3s), name, shortened cwd, state badge with reason, last event in words, age of the last event. Keys: `j`/`k` move, `enter` focus, `/` filter (name, directory, state; `escape` clears), `e` toggle ended sessions (hidden by default), `n` new session, `q` quit. The new-session dialog has a directory field (default: the selected session's directory; `→` accepts a directory completion), an optional name and a multi-line prompt; `ctrl+s` launches, `escape` cancels, and a launch error stays in the dialog.
 
 ## Milestones
 

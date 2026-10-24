@@ -28,6 +28,10 @@ class Config:
     replay_hours: int = 24
     reconcile_interval_s: float = 15
     claude_bin: str = "claude"
+    # Extra `claude` arguments for launch_session, e.g. ["--model", "opus"].
+    launch_args: tuple[str, ...] = ()
+    # tmux -L socket name; None is the default server. For the dev harness.
+    tmux_socket: str | None = None
 
     @property
     def hooks_url(self) -> str:
@@ -67,4 +71,6 @@ def load() -> Config:
     with path.open("rb") as f:
         data = tomllib.load(f)
     known = {k: v for k, v in data.items() if k in Config.__dataclass_fields__}
+    if "launch_args" in known:
+        known["launch_args"] = tuple(str(a) for a in known["launch_args"])
     return Config(**known)

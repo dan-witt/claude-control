@@ -6,6 +6,8 @@ from typing import Any
 from .events import Event, launched_task, stopped_task, task_notices
 
 IDLE_AFTER_S = 600
+# A launched session with no SessionStart after this long is checked (see check_launches).
+LAUNCH_GRACE_S = 15
 # Reconciliation acts only on sessions whose last event is older than this: `claude agents`
 # can lag hooks, and a new process can post SessionStart before it is listed.
 STALE_AFTER_S = 15
@@ -75,6 +77,9 @@ class Session:
     permission_tool: str | None = None
     tasks: dict[str, Task] = field(default_factory=dict)
     ended_at: float | None = None
+    # Launched by launch_session and not heard from yet: `claude agents` does not list it
+    # until it is past startup prompts such as folder trust.
+    awaiting_start: bool = False
 
     @property
     def current_tool(self) -> str | None:
@@ -156,6 +161,7 @@ class Tracker:
         if agent:
             self._agent_event(s, e)
             return s
+        s.awaiting_start = False
         if e.name != "SessionEnd":
             self._attach(s, e)
         if e.payload.get("cwd"):
@@ -246,7 +252,7 @@ class Tracker:
 
     def _on_SessionStart(self, s: Session, e: Event) -> None:
         # New sessions start idle; compact and a second resume of a live session keep state.
-        if s.state == "ended":
+        if s.state == "ended" or s.state == "starting" or s.last_event == "waiting at startup":
             s.ended_at = None
             s.set("idle")
 
@@ -343,6 +349,38 @@ class Tracker:
 
     # --- time
 
+    def launching(self, session_id: str, name: str, cwd: str, pane: str, now: float) -> Session:
+        s = Session(session_id, "starting", started_at=now, last_event_at=now)
+        s.name, s.cwd, s.last_event, s.awaiting_start = name, cwd, "launched", True
+        s.processes.append(Process(None, None, pane, now, last_event_at=now))
+        self.sessions[session_id] = s
+        return s
+
+    def pending_launches(self, now: float) -> list[str]:
+        """Launched sessions still without a hook event after LAUNCH_GRACE_S."""
+        return [
+            s.session_id
+            for s in self.sessions.values()
+            if s.awaiting_start and s.state != "ended" and now - s.started_at >= LAUNCH_GRACE_S
+        ]
+
+    def check_launch(self, session_id: str, running: bool, now: float) -> None:
+        """Record whether a pending launch's claude process runs.
+
+        Running without SessionStart means it is waiting at a startup prompt (folder trust,
+        which blocks SessionStart); not running means it exited or never started.
+        """
+        s = self.sessions.get(session_id)
+        if s is None or not s.awaiting_start:
+            return
+        if running:
+            if s.state == "starting":
+                s.set("waiting", "input")
+                s.last_event = "waiting at startup"
+        else:
+            s.awaiting_start = False
+            self._end(s, "launch_failed", now)
+
     def tick(self, now: float) -> None:
         for s in self.sessions.values():
             if (
@@ -368,6 +406,8 @@ class Tracker:
         for s in self.sessions.values():
             if s.state == "ended":
                 continue
+            if s.awaiting_start:
+                continue  # check_launches decides
             for p in list(s.processes):
                 gone = (p.pid is not None and p.pid not in listed) or (
                     p.pid is None and s.session_id not in by_session

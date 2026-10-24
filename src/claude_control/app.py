@@ -5,6 +5,7 @@ import logging
 import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any
 
 from mcp.server.subscriptions import InMemorySubscriptionBus, ResourceUpdated
 from starlette.applications import Starlette
@@ -16,7 +17,7 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import mcp_server, reconcile, tmux
+from . import launch, mcp_server, reconcile, tmux
 from .events import Event
 from .hooks_install import TIMEOUT_S
 from .state import Agent, Tracker
@@ -34,13 +35,13 @@ CLOSE = {"connection": "close"}
 Listing = Callable[[], Awaitable[tuple[list[Agent], dict[int, str]] | None]]
 
 
-def system_listing(claude_bin: str) -> Listing:
+def system_listing(claude_bin: str, tmux_socket: str | None = None) -> Listing:
     async def listing() -> tuple[list[Agent], dict[int, str]] | None:
         agents = await reconcile.list_agents(claude_bin)
         if agents is None:
             return None
-        panes = reconcile.panes_for([a.pid for a in agents], await reconcile.pane_pids())
-        return agents, panes
+        pane_by_pid = await tmux.pane_pids(tmux_socket)
+        return agents, reconcile.panes_for([a.pid for a in agents], pane_by_pid)
 
     return listing
 
@@ -72,12 +73,29 @@ def create_app(
     replay_hours: float = 24,
     listing: Listing | None = None,
     reconcile_interval_s: float = 15,
-    focus: mcp_server.Focus = tmux.focus,
+    focus: mcp_server.Focus | None = None,
+    launcher: launch.Launcher | None = None,
+    claude_bin: str = "claude",
+    launch_args: tuple[str, ...] = (),
+    tmux_socket: str | None = None,
     slow_after_s: float = TIMEOUT_S,
 ) -> Starlette:
     tracker = tracker or Tracker()
     bus = InMemorySubscriptionBus()
-    mcp = mcp_server.build(tracker, bus, focus)
+    launcher = launcher or launch.Launcher(
+        tracker, claude_bin=claude_bin, extra_args=launch_args, tmux_socket=tmux_socket
+    )
+
+    async def focus_pane(pane: str) -> str:
+        return await tmux.focus(pane, tmux_socket)
+
+    async def launch_session(cwd: str, prompt: str | None, name: str | None) -> dict[str, Any]:
+        assert launcher is not None
+        result = await launcher(cwd, prompt, name, time.time())
+        await publish_if_changed()
+        return result
+
+    mcp = mcp_server.build(tracker, bus, focus or focus_pane, launch_session)
     mcp_app = mcp.streamable_http_app(streamable_http_path="/mcp")
     published = [tracker.signature()]
 
@@ -163,6 +181,8 @@ def create_app(
         if result is not None:
             agents, panes = result
             tracker.reconcile(agents, panes, now)
+        for session_id in tracker.pending_launches(now):
+            tracker.check_launch(session_id, launch.find_process(session_id) is not None, now)
         tracker.tick(now)
         await publish_if_changed()
 

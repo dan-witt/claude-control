@@ -1,44 +1,57 @@
-"""tmux commands the daemon runs. None of them starts a tmux server."""
+"""tmux commands. A server is only ever started in its own systemd scope (DESIGN.md, "tmux").
+
+`socket` selects a server with `tmux -L` (tests and the dev harness); None is the default server.
+"""
 
 import asyncio
 import shlex
 import subprocess
 
 TIMEOUT_S = 5
+SCOPE_UNIT = "claude-tmux"
 
 
 class TmuxError(Exception):
     pass
 
 
-async def _tmux(*args: str) -> str:
-    proc = await asyncio.create_subprocess_exec(
-        "tmux",
-        *args,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+def _prefix(socket: str | None) -> list[str]:
+    return ["tmux", *(["-L", socket] if socket else [])]
+
+
+async def _exec(argv: list[str]) -> tuple[int, str, str]:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as e:
+        raise TmuxError(f"{argv[0]} not available: {e}") from e
     try:
         out, err = await asyncio.wait_for(proc.communicate(), TIMEOUT_S)
     except TimeoutError:
         proc.kill()
         await proc.wait()
-        raise TmuxError(f"tmux {args[0]} timed out") from None
-    if proc.returncode != 0:
-        raise TmuxError(err.decode(errors="replace").strip() or f"tmux {args[0]} failed")
-    return out.decode()
+        raise TmuxError(f"{shlex.join(argv[:3])} timed out") from None
+    assert proc.returncode is not None
+    return proc.returncode, out.decode(), err.decode(errors="replace").strip()
 
 
-async def focus(pane: str) -> str:
+async def _tmux(socket: str | None, *args: str) -> str:
+    code, out, err = await _exec([*_prefix(socket), *args])
+    if code != 0:
+        raise TmuxError(err or f"tmux {args[0]} failed")
+    return out
+
+
+async def focus(pane: str, socket: str | None = None) -> str:
     """Switch the most recently active tmux client to `pane`; returns the client name.
 
     `switch-client -t <pane id>` selects the pane's session, window and pane (tmux 3.4).
     """
-    try:
-        listing = await _tmux("list-clients", "-F", "#{client_activity} #{client_name}")
-    except OSError as e:
-        raise TmuxError(f"tmux not available: {e}") from e
+    listing = await _tmux(socket, "list-clients", "-F", "#{client_activity} #{client_name}")
     clients = []
     for line in listing.splitlines():
         activity, _, name = line.partition(" ")
@@ -47,8 +60,51 @@ async def focus(pane: str) -> str:
     if not clients:
         raise TmuxError("no tmux client is attached")
     client = max(clients)[1]
-    await _tmux("switch-client", "-c", client, "-t", pane)
+    await _tmux(socket, "switch-client", "-c", client, "-t", pane)
     return client
+
+
+async def new_window(
+    session: str, window: str, cwd: str, command: str, socket: str | None = None
+) -> str:
+    """Open a window running `command` in `cwd`, creating the session (and server) if needed.
+
+    Returns the new pane's id. The window is created detached, so no client moves to it.
+    """
+    tmux = _prefix(socket)
+    code, _, _ = await _exec([*tmux, "has-session", "-t", f"={session}"])
+    if code == 0:
+        argv = [*tmux, "new-window", "-d", "-t", f"={session}:", "-n", window, "-c", cwd]
+    else:
+        argv = [*tmux, "new-session", "-d", "-s", session, "-n", window, "-c", cwd]
+        server_running = (await _exec([*tmux, "list-sessions"]))[0] == 0
+        if not server_running and socket is None:
+            scope = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={SCOPE_UNIT}"]
+            argv = [*scope, *argv]
+    code, out, err = await _exec([*argv, "-P", "-F", "#{pane_id}", command])
+    if code != 0:
+        raise TmuxError(err or "could not open a tmux window")
+    return out.strip()
+
+
+async def type_line(pane: str, text: str, socket: str | None = None) -> None:
+    """Type `text` into `pane` literally and press Enter."""
+    await _tmux(socket, "send-keys", "-t", pane, "-l", text)
+    await _tmux(socket, "send-keys", "-t", pane, "Enter")
+
+
+async def pane_pids(socket: str | None = None) -> dict[int, str]:
+    """pane_pid -> pane id for every pane; empty when no server runs."""
+    try:
+        out = await _tmux(socket, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}")
+    except TmuxError:
+        return {}
+    panes = {}
+    for line in out.splitlines():
+        pid, _, pane = line.partition(" ")
+        if pid.isdigit() and pane:
+            panes[int(pid)] = pane
+    return panes
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -60,11 +116,9 @@ def ensure_window(
 ) -> list[list[str]]:
     """Make sure tmux session `session` has a window named `window` running `command`.
 
-    A tmux server started here gets its own systemd scope, so it outlives the terminal and
-    is not in any service's cgroup. Returns the commands it ran. `socket` (tmux -L) is for
-    tests.
+    Synchronous, for the CLI. Returns the commands it ran.
     """
-    tmux = ["tmux", *(["-L", socket] if socket else [])]
+    tmux = _prefix(socket)
     shell_command = shlex.join(command)
     ran: list[list[str]] = []
 
@@ -78,7 +132,7 @@ def ensure_window(
         new = [*tmux, "new-session", "-d", "-s", session, "-n", window, shell_command]
         server_running = _run([*tmux, "list-sessions"]).returncode == 0
         if not server_running and socket is None:
-            new = ["systemd-run", "--user", "--scope", "--quiet", "--unit=claude-tmux", *new]
+            new = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={SCOPE_UNIT}", *new]
         run(new)
         return ran
     windows = _run([*tmux, "list-windows", "-t", f"={session}", "-F", "#{window_name}"])

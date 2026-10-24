@@ -12,6 +12,7 @@ from mcp.server.subscriptions import SubscriptionBus
 from mcp.types import ToolAnnotations
 
 from . import tmux
+from .launch import LaunchError
 from .state import Session, Tracker
 
 SESSIONS_URI = "sessions://"
@@ -25,6 +26,7 @@ error (the turn failed), ended.
 A session is identified by its session_id, a unique prefix of it, or its name."""
 
 Focus = Callable[[str], Awaitable[str]]
+Launch = Callable[[str, str | None, str | None], Awaitable[dict[str, Any]]]
 
 
 def _iso(ts: float | None) -> str | None:
@@ -94,7 +96,16 @@ def live_sessions(tracker: Tracker, states: list[str] | None = None) -> list[Ses
     return sorted(rows, key=lambda s: s.started_at)
 
 
-def build(tracker: Tracker, bus: SubscriptionBus, focus: Focus = tmux.focus) -> MCPServer:
+async def _no_launch(cwd: str, prompt: str | None, name: str | None) -> dict[str, Any]:
+    raise LaunchError("launching is not configured")
+
+
+def build(
+    tracker: Tracker,
+    bus: SubscriptionBus,
+    focus: Focus = tmux.focus,
+    launch: Launch = _no_launch,
+) -> MCPServer:
     mcp = MCPServer(name="claude-control", instructions=INSTRUCTIONS, subscriptions=bus)
     read_only = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
@@ -129,6 +140,27 @@ def build(tracker: Tracker, bus: SubscriptionBus, focus: Focus = tmux.focus) -> 
         except tmux.TmuxError as e:
             raise ToolError(str(e)) from e
         return {"session_id": s.session_id, "pane": pane, "client": client}
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            read_only_hint=False, destructive_hint=False, open_world_hint=False
+        )
+    )
+    async def launch_session(
+        cwd: str, prompt: str | None = None, name: str | None = None
+    ) -> dict[str, Any]:
+        """Start a new Claude Code session in a new window of the `claude` tmux session.
+
+        `cwd` is an existing absolute directory (`~` allowed). `prompt` is submitted as the
+        first message; without it the session waits at an empty prompt. `name` defaults to the
+        directory name plus two hex digits. Returns the new session_id in state `starting`; the
+        session becomes `idle`/`running` when Claude starts, `waiting`/`input` if it stops at a
+        startup prompt such as folder trust, or `ended`/`launch_failed` if it exits first.
+        """
+        try:
+            return await launch(cwd, prompt, name)
+        except LaunchError as e:
+            raise ToolError(str(e)) from e
 
     @mcp.resource(
         SESSIONS_URI,

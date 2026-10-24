@@ -23,8 +23,11 @@ def cmd_serve(args: argparse.Namespace, cfg: config.Config) -> None:
         token=config.ensure_token(),
         retention_days=cfg.retention_days,
         replay_hours=cfg.replay_hours,
-        listing=system_listing(cfg.claude_bin),
+        listing=system_listing(cfg.claude_bin, cfg.tmux_socket),
         reconcile_interval_s=cfg.reconcile_interval_s,
+        claude_bin=cfg.claude_bin,
+        launch_args=cfg.launch_args,
+        tmux_socket=cfg.tmux_socket,
     )
     uvicorn.run(app, host=cfg.host, port=cfg.port, log_level=args.log_level)
 
@@ -48,6 +51,12 @@ TUI_WINDOW = "tui"
 def cmd_tui(args: argparse.Namespace, cfg: config.Config) -> None:
     if os.environ.get("TMUX") or args.here:
         from .tui import SessionsApp, mcp_backend
+
+        # Anything written to the terminal draws over the app (httpx2 logs every request).
+        config.state_dir().mkdir(parents=True, exist_ok=True)
+        logging.basicConfig(
+            filename=config.state_dir() / "tui.log", level=logging.WARNING, force=True
+        )
 
         url = f"http://{cfg.host}:{cfg.port}/mcp"
         SessionsApp(mcp_backend(url, config.ensure_token())).run()
