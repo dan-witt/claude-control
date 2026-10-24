@@ -19,6 +19,9 @@ log = logging.getLogger(__name__)
 
 LOCAL_HOSTS = ["127.0.0.1", "localhost"]
 PRUNE_INTERVAL_S = 3600
+# Claude Code reuses idle connections; uvicorn closes them after 5s idle. A hook sent as the
+# server closes one fails with "socket hang up" and the event is lost. One connection per hook.
+CLOSE = {"connection": "close"}
 
 
 def create_app(
@@ -29,14 +32,14 @@ def create_app(
         # Requiring JSON forces a CORS preflight, so a web page cannot post forged events.
         media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
         if media_type != "application/json":
-            return PlainTextResponse("expected application/json", status_code=415)
+            return PlainTextResponse("expected application/json", status_code=415, headers=CLOSE)
         body = (await request.body()).decode("utf-8", errors="replace")
         try:
             data = json.loads(body)
         except json.JSONDecodeError:
-            return PlainTextResponse("invalid JSON", status_code=400)
+            return PlainTextResponse("invalid JSON", status_code=400, headers=CLOSE)
         if not isinstance(data, dict):
-            return PlainTextResponse("expected a JSON object", status_code=400)
+            return PlainTextResponse("expected a JSON object", status_code=400, headers=CLOSE)
         store.append(
             payload=body,
             session_id=data.get("session_id"),
@@ -55,7 +58,7 @@ def create_app(
                 TIMEOUT_S,
             )
         # Empty 2xx: Claude Code treats it as "no decision", so tool and permission flow is unchanged.
-        return Response(status_code=204)
+        return Response(status_code=204, headers=CLOSE)
 
     async def health(_: Request) -> Response:
         return PlainTextResponse("ok")

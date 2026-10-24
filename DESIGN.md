@@ -36,12 +36,17 @@ Hooks are installed idempotently by `install-hooks` into `~/.claude/settings.jso
 
 A stopped daemon costs sessions nothing (connection refused is immediate; the UI shows a non-blocking "hook error"). A daemon that accepts connections but does not answer costs up to `timeout` per blocking hook: measured +7–8s on a short turn with one tool call at `timeout: 2`, hence `timeout: 1`. The request path must never block (no subprocess or slow I/O on the event loop). The daemon logs a warning when handling a `/hooks` request takes `timeout` or longer; time spent before the handler runs (a stalled event loop) is not measured.
 
+`/hooks` responses carry `Connection: close`. Claude Code reuses idle connections and uvicorn closes them after 5s idle; a hook sent as the server closes its connection fails with `socket hang up` and the event is lost (observed once, on a `Stop`).
+
+Any single event can still be lost (daemon stopped or restarting). State corrects itself on the session's next event; reconciliation catches a missed turn end only when the process reports `idle`.
+
 Running sessions pick up settings changes without a restart.
 
 Reconciliation: at startup and every 15s the daemon runs `claude agents --json` (documented CLI; ~0.12s wall, ~0.14s CPU per call). The underlying `~/.claude/sessions/*.json` registry is undocumented and not read directly; it keeps entries for killed processes. Reconciliation:
 - discovers sessions started before the daemon (they post nothing until their next prompt);
 - marks a process ended when its pid disappears (kill -9, a closed terminal that sent no `SessionEnd`);
-- reads each process's `status` (`busy`/`idle`). This is the only signal that a turn ended by interrupt or permission denial, which fire no hook.
+- reads each process's `status` (`busy`/`idle`). This is the only signal that a turn ended by interrupt or permission denial, which fire no hook. `busy` also covers background work (forks, background shells) after the main agent's `Stop`, so while background work runs a missed turn end is not detectable this way;
+- finds the tmux pane of a discovered process: walk its parent pids up to one that is a pane's `#{pane_pid}` in `tmux list-panes -a`. This covers both `claude` started from a pane's shell and `claude` as the pane's own process. A chain that reaches pid 1 without a match is a session outside tmux.
 
 Background (`--bg`) sessions are listed, view-only.
 
@@ -50,19 +55,22 @@ Background (`--bg`) sessions are listed, view-only.
 - Primary key: `session_id`. Each session holds a set of attached processes `{socket, pid, tmux_pane}`; in-memory maps `socket → session_id`, `pid → session_id` and `pane → session_id` resolve lookups.
 - One `session_id` can have several processes: `claude --resume` of the same session in two terminals runs two pids with one id. `focus_session` picks the process with the most recent hook event.
 - `/clear` and in-session `/resume`: the old `session_id` gets `SessionEnd` (reason `clear` / `resume`) and the same process starts a new or other `session_id`; the process moves to it.
+- Background tasks belong to the session that launched them and do not have their own sessions. A task opens on the `PostToolUse` that launched it: `Agent` with `tool_response.status: "async_launched"` (id `tool_response.agentId`), or `Bash` with `tool_response.backgroundTaskId`. It closes on a `UserPromptSubmit` whose `prompt` is a `<task-notification>` with that `task-id`. Tool events from a fork carry its id as `agent_id` (plus `agent_type: fork`) under the parent's `session_id` and socket. A fork the user starts from the UI has no launching `PostToolUse`; it is known from its first event with an unseen `agent_id`.
 
-States (stable names; may be revised after milestone 1 discovery):
+States follow the main agent only; events with an `agent_id` update background activity and never change the state.
 
 | State | Set by |
 | --- | --- |
 | `starting` | `launch_session`, until `SessionStart` arrives; `error` with reason `launch_timeout` after ~15s |
-| `running` | `UserPromptSubmit`, or tool activity after a wait |
-| `waiting` | reason `permission` (`PermissionRequest`, `Notification` `permission_prompt`), `input` (`PermissionRequest` for `AskUserQuestion`, `Notification` `idle_prompt` / `agent_needs_input` / elicitation), `done` (`Stop`) |
+| `running` | `UserPromptSubmit` (typed, queued mid-turn, or a `<task-notification>`; no `Stop` need precede it), or main-agent tool activity after a wait |
+| `waiting` | reason `permission` (`PermissionRequest`, including `ExitPlanMode`), `input` (`PermissionRequest` for `AskUserQuestion`, `Notification` `idle_prompt` / `agent_needs_input` / elicitation), `done` (`Stop`). `Notification` `permission_prompt` sets `permission` only while a `PermissionRequest` is outstanding. |
 | `idle` | `waiting/done` with no event for 10 min |
 | `error` | `StopFailure` |
 | `ended` | `SessionEnd`, or pid gone at reconciliation |
 
-Activity: `PreToolUse` sets `current_tool` and increments a tool counter; `PostToolUse` or `PostToolUseFailure` clears `current_tool` and increments it. The TUI shows a spinner while `current_tool` is set or the counter changed in the last few seconds.
+A `PermissionRequest` can come from a hook-driven MCP call with nothing on screen; it stays `waiting/permission` until the next main-agent event or `idle_prompt`.
+
+Activity: main-agent tool calls are tracked as a set of open `tool_use_id`s (`PreToolUse` adds, `PostToolUse`/`PostToolUseFailure` removes) plus a counter. Parallel calls overlap and finish out of order. `current_tool` is the most recently opened call still open. Background activity is the set of open background tasks and the time of the last event from each fork. The TUI shows a spinner while a main-agent call is open or the counter changed in the last few seconds, and a separate background indicator while tasks are open. `PreToolUse` for a call can precede its execution by up to a minute when the model emits several calls in one response; the spinner shows activity during that time, when the model is generating.
 
 ## tmux
 
@@ -77,7 +85,7 @@ Activity: `PreToolUse` sets `current_tool` and increments a tool counter; `PostT
 | Tool | Does |
 | --- | --- |
 | `list_sessions(states?)` | Sessions with state, reason, last event, age, cwd, name |
-| `get_session(session_id)` | One session: last assistant message or notification text, processes, panes, tool counter, current tool |
+| `get_session(session_id)` | One session: last assistant message or notification text, processes, panes, tool counter, current tool, open background tasks |
 | `focus_session(session_id)` | Switches the most recent tmux client to the session's pane |
 | `launch_session(cwd, prompt?, name?)` | New window in the `claude` tmux session; returns the pre-assigned `session_id` in state `starting`. `cwd` must exist; `name` defaults to the cwd basename plus a short suffix. No free-form CLI arguments. |
 
@@ -97,9 +105,9 @@ Rows in fixed order by start time (never re-sorted by urgency): name, shortened 
 4. TUI list and focus.
 5. Launch.
 
-## Observed hook behaviour (Claude Code 2.1.309, 2026-10-23)
+## Observed hook behaviour (Claude Code 2.1.309–2.1.310, 2026-10-23)
 
-From test sessions in a separate tmux server (Haiku) with every documented hook event pointed at a dev daemon, plus real sessions on the live daemon. Raw payloads from the test runs are not kept; repeat with the harness described in `CLAUDE.md`.
+From test sessions in a separate tmux server (Haiku) with every documented hook event pointed at a dev daemon, plus real sessions on the live daemon (the fork rows are from a real session running six forks). Raw payloads from the test runs are not kept; repeat with the harness described in `CLAUDE.md`.
 
 | Case | Events observed | Consequence for the state machine |
 | --- | --- | --- |
@@ -109,6 +117,15 @@ From test sessions in a separate tmux server (Haiku) with every documented hook 
 | Bash exits non-zero | `PostToolUse` (not a failure) | |
 | Tool error (Read of a missing file) | `PreToolUse` → `PostToolUseFailure` | `PostToolUseFailure` must clear `current_tool` |
 | Three parallel Reads | Three sequential `Pre`/`Post` pairs, then one `PostToolBatch` | Pairs did not overlap |
+| Four parallel Bash calls | Four `PreToolUse`, then four `PostToolUse` in a different order | Open calls are a set keyed by `tool_use_id` |
+| Six `Agent` (fork) calls in one response | `PreToolUse` for each as the model emitted it, spread over 62s; all six `PostToolUse` together at launch with `status: async_launched`; first fork tool call 5s later | `PostToolUse` means launched, not finished |
+| Forks running | Tool events with `agent_id`, `agent_type: fork`, parent `session_id`, `prompt_id` and socket; overlapping each other and the main agent; up to 136s before a fork's first tool call | Background activity, not session state |
+| Fork the user starts from the UI | No `Agent` tool event; first sign is a tool event with a new `agent_id` (a slug of its prompt) | |
+| Fork or background shell finishes | `UserPromptSubmit` with `prompt` `<task-notification>` carrying `task-id` (= `agentId` / `backgroundTaskId`) and `tool-use-id`; a new turn if the main agent was idle, otherwise delivered between its tool calls with no `Stop` before it | Closes the background task |
+| Message typed while a turn runs | `UserPromptSubmit` when delivered between tool calls; no `Stop` before it | |
+| Main agent stopped, background work running | `claude agents` reports `busy`; observed >5 min after the final `Stop` with a background build running | Reconciliation cannot detect a missed turn end then |
+| Tool call approved by auto mode | `PreToolUse` → `PostToolUse`, no `PermissionRequest` (94 calls) | `PermissionRequest` means a prompt (or a hook-driven MCP call) |
+| Permission prompt answered within ~6s | No `permission_prompt` (answered at 5.2s and 6.0s) | |
 | Permission prompt | `PreToolUse` → `PermissionRequest` (same 20ms) → `Notification` `permission_prompt` ~6s later → `PostToolUse` on approval | `PermissionRequest` is the prompt signal; `current_tool` is set while waiting |
 | `AskUserQuestion` | `PreToolUse` → `PermissionRequest` with `tool_name: AskUserQuestion` → `permission_prompt` ~6s later → `PostToolUse` on answer | Reason `input`, distinguished by tool name |
 | Plan approval | `PreToolUse` → `PermissionRequest` with `tool_name: ExitPlanMode` → `permission_prompt` ~6s later | Reason `permission` (or a distinct `plan`) by tool name |
@@ -131,5 +148,7 @@ From test sessions in a separate tmux server (Haiku) with every documented hook 
 | Background task completion | Starts a new turn: `UserPromptSubmit` → `Stop` | |
 | Daemon frozen (SIGSTOP) | Short turn 2.5–4s → 10.8–11.8s. Requests queued in the socket were processed on resume with that time as `received_at` | Never block the request path; `received_at` is arrival, not event time |
 | Daemon stopped | No slowdown; events lost; UI shows "Stop hook error occurred" | |
+| Keep-alive race | A `Stop` sent 5.0s after the previous request on the same connection failed with `socket hang up` (uvicorn's idle timeout is 5s); the next request opened a new connection | Fixed by `Connection: close` |
+| Pane lookup for a discovered pid | Parent-pid walk to `#{pane_pid}` matched the `X-Tmux-Pane` from `SessionStart` for `claude` started from a pane's shell and for `claude` as the pane process | |
 
 Request details: `content-type: application/json`, `host: 127.0.0.1:<port>`, `user-agent: axios/…`. `X-Tmux-Pane` resolves on every hook; `X-Claude-Pid` equals the claude pid; `claude agents --json` names are per process and change on resume (`live-b0` → `live-b4`, `live-8c`).

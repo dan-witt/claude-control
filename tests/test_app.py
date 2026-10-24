@@ -33,6 +33,7 @@ def test_stores_raw_payload_with_pane(client, store):
     r = post(client, payload, **{"x-tmux-pane": "%3"})
     assert r.status_code == 204
     assert r.content == b""
+    assert r.headers["connection"] == "close"
     [e] = store.recent()
     assert (e.session_id, e.event, e.tmux_pane) == ("s1", "Stop", "%3")
     assert json.loads(e.payload) == payload
@@ -47,6 +48,7 @@ def test_empty_pane_header_stored_as_null(client, store):
 def test_rejects_non_json_content_type(client, store):
     r = client.post("/hooks", content="{}", headers={"content-type": "text/plain"})
     assert r.status_code == 415
+    assert r.headers["connection"] == "close"
     assert store.recent() == []
 
 
