@@ -2,8 +2,8 @@
 
     uv run python scripts/fixture.py DB OUT.jsonl --session ID [--session ID] [--from N] [--to N]
 
-Keeps event structure and ids; prompts, messages, tool input/output and paths are replaced,
-so fixtures can come from sessions doing real work.
+Keeps event structure and ids; prompts, messages, tool input/output, paths and MCP tool names
+are replaced, so fixtures can come from sessions doing real work.
 """
 
 import argparse
@@ -46,8 +46,22 @@ def scrub_prompt(prompt: str) -> str:
     return "\n".join(parts)
 
 
+_mcp_tools: dict[str, str] = {}
+
+
+def scrub_tool_name(name: str) -> str:
+    """MCP tool names say which servers are in use; give each a stable placeholder."""
+    if not name.startswith("mcp__"):
+        return name
+    if name not in _mcp_tools:
+        _mcp_tools[name] = f"mcp__server__tool{len(_mcp_tools) + 1}"
+    return _mcp_tools[name]
+
+
 def scrub(payload: dict) -> dict:
     out = {k: v for k, v in payload.items() if k in KEEP}
+    if isinstance(out.get("tool_name"), str):
+        out["tool_name"] = scrub_tool_name(out["tool_name"])
     if "error" in payload:
         # StopFailure carries an error code; PostToolUseFailure carries the tool's output.
         stop = payload.get("hook_event_name") == "StopFailure"
