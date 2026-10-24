@@ -13,6 +13,8 @@ LAUNCH_GRACE_S = 15
 STALE_AFTER_S = 15
 
 TOOL_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"}
+# SessionEnd reasons / SessionStart sources where the process moves to another session.
+HANDOFF = {"clear", "resume"}
 
 
 @dataclass
@@ -80,6 +82,11 @@ class Session:
     # Launched by launch_session and not heard from yet: `claude agents` does not list it
     # until it is past startup prompts such as folder trust.
     awaiting_start: bool = False
+    state_since: float = 0.0
+    replaces: str | None = None
+
+    def __post_init__(self) -> None:
+        self.state_since = self.state_since or self.started_at
 
     @property
     def current_tool(self) -> str | None:
@@ -91,7 +98,9 @@ class Session:
         panes = [p for p in self.processes if p.pane]
         return max(panes, key=lambda p: p.last_event_at).pane if panes else None
 
-    def set(self, state: str, reason: str | None = None) -> None:
+    def set(self, state: str, reason: str | None = None, *, at: float) -> None:
+        if (state, reason) != (self.state, self.reason):
+            self.state_since = at
         self.state, self.reason = state, reason
 
     def end_turn(self) -> None:
@@ -103,6 +112,7 @@ class Session:
             "session_id": self.session_id,
             "state": self.state,
             "reason": self.reason,
+            "state_since": self.state_since,
             "name": self.name,
             "cwd": self.cwd,
             "kind": self.kind,
@@ -126,6 +136,7 @@ class Session:
                 for t in self.tasks.values()
             ],
             "ended_at": self.ended_at,
+            "replaces": self.replaces,
         }
 
 
@@ -142,6 +153,9 @@ class Tracker:
         self.idle_after = idle_after
         self.stale_after = stale_after
         self.sessions: dict[str, Session] = {}
+        # Processes released by a SessionEnd in HANDOFF, waiting for the SessionStart of the
+        # session they move to: (process, old session_id, released at).
+        self._released: list[tuple[Process, str, float]] = []
 
     # --- hook events
 
@@ -156,7 +170,7 @@ class Tracker:
             # unless the event itself says otherwise.
             s = Session(e.session_id, "running", started_at=e.received_at, last_event_at=0)
             if e.name == "SessionStart":
-                s.set("idle")
+                s.set("idle", at=e.received_at)
             self.sessions[e.session_id] = s
         if agent:
             self._agent_event(s, e)
@@ -214,8 +228,11 @@ class Tracker:
         """Record the process that sent `e`, moving it from another session if needed."""
         p = self._find_process(s, e)
         if p is None:
-            reason = e.payload.get("source") or "moved"
-            p = self._take(s, e.socket, e.pid, reason, e.received_at)
+            source = e.payload.get("source")
+            p, old = self._take(s, e.socket, e.pid, source or "moved", e.received_at)
+            if e.name == "SessionStart" and source in HANDOFF:
+                old = old or self._claim_released(e)
+                s.replaces = old or s.replaces
             p = p or Process(e.socket, e.pid, e.pane, e.received_at)
             s.processes.append(p)
         p.socket = p.socket or e.socket
@@ -225,14 +242,15 @@ class Tracker:
 
     def _take(
         self, s: Session, socket: str | None, pid: int | None, reason: str, at: float
-    ) -> Process | None:
+    ) -> tuple[Process | None, str | None]:
         """Detach the process with this socket or pid from any other session.
 
-        A process changes session on /clear and /resume; normally the old session has already
-        ended by SessionEnd, so this matters only when that event was lost.
+        Returns the process and the session it came from. A process changes session on /clear
+        and /resume; normally the old session has already ended by SessionEnd, so this matters
+        only when that event was lost.
         """
         if not socket and not pid:
-            return None
+            return None, None
         for other in self.sessions.values():
             if other is s:
                 continue
@@ -241,11 +259,26 @@ class Tracker:
                     other.processes.remove(p)
                     if not other.processes and other.state != "ended":
                         self._end(other, reason, at)
-                    return p
+                    return p, other.session_id
+        return None, None
+
+    def _claim_released(self, e: Event) -> str | None:
+        """The session that released the process sending `e`, if one did recently."""
+        self._released = [r for r in self._released if e.received_at - r[2] < self.stale_after]
+        for i, (p, session_id, _) in enumerate(self._released):
+            if e.socket and p.socket:
+                same = e.socket == p.socket
+            elif e.pid and p.pid:
+                same = e.pid == p.pid
+            else:
+                same = bool(e.pane) and e.pane == p.pane
+            if same:
+                del self._released[i]
+                return session_id
         return None
 
     def _end(self, s: Session, reason: str | None, at: float) -> None:
-        s.set("ended", reason)
+        s.set("ended", reason, at=at)
         s.end_turn()
         s.tasks.clear()
         s.ended_at = at
@@ -254,25 +287,26 @@ class Tracker:
         # New sessions start idle; compact and a second resume of a live session keep state.
         if s.state == "ended" or s.state == "starting" or s.last_event == "waiting at startup":
             s.ended_at = None
-            s.set("idle")
+            s.set("idle", at=e.received_at)
 
     def _on_UserPromptSubmit(self, s: Session, e: Event) -> None:
         for notice in task_notices(e.payload.get("prompt") or ""):
             if notice.status is not None:
                 s.tasks.pop(notice.task_id, None)
         s.permission_tool = None
-        s.set("running")
+        s.set("running", at=e.received_at)
 
     def _on_PreToolUse(self, s: Session, e: Event) -> None:
         if e.tool_use_id:
             s.open_tools[e.tool_use_id] = e.tool_name or ""
         if s.state != "running":
             s.permission_tool = None
-            s.set("running")
+            s.set("running", at=e.received_at)
 
     def _on_PermissionRequest(self, s: Session, e: Event) -> None:
         s.permission_tool = e.tool_name
-        s.set("waiting", "input" if e.tool_name == "AskUserQuestion" else "permission")
+        reason = "input" if e.tool_name == "AskUserQuestion" else "permission"
+        s.set("waiting", reason, at=e.received_at)
 
     def _on_PostToolUse(self, s: Session, e: Event) -> None:
         if e.tool_use_id:
@@ -287,7 +321,7 @@ class Tracker:
             s.tasks.pop(stopped, None)
         if s.state != "running":
             s.permission_tool = None
-            s.set("running")
+            s.set("running", at=e.received_at)
 
     _on_PostToolUseFailure = _on_PostToolUse
 
@@ -300,24 +334,26 @@ class Tracker:
             # (interrupt) or a dismissed prompt, it is the only hook.
             if s.state == "running" or (s.state == "waiting" and s.reason != "done"):
                 s.end_turn()
-                s.set("waiting", "done")
+                s.set("waiting", "done", at=e.received_at)
         elif kind in ("elicitation_dialog", "agent_needs_input"):
-            s.set("waiting", "input")
+            s.set("waiting", "input", at=e.received_at)
 
     def _on_Stop(self, s: Session, e: Event) -> None:
         s.end_turn()
         s.message = e.payload.get("last_assistant_message") or s.message
-        s.set("waiting", "done")
+        s.set("waiting", "done", at=e.received_at)
 
     def _on_StopFailure(self, s: Session, e: Event) -> None:
         s.end_turn()
         s.message = e.payload.get("last_assistant_message") or s.message
-        s.set("error", e.payload.get("error") or None)
+        s.set("error", e.payload.get("error") or None, at=e.received_at)
 
     def _on_SessionEnd(self, s: Session, e: Event) -> None:
         p = self._find_process(s, e)
         if p is not None:
             s.processes.remove(p)
+            if e.payload.get("reason") in HANDOFF:
+                self._released.append((p, s.session_id, e.received_at))
         if not s.processes and s.state != "ended":
             self._end(s, e.payload.get("reason"), e.received_at)
 
@@ -375,7 +411,7 @@ class Tracker:
             return
         if running:
             if s.state == "starting":
-                s.set("waiting", "input")
+                s.set("waiting", "input", at=now)
                 s.last_event = "waiting at startup"
         else:
             s.awaiting_start = False
@@ -389,7 +425,7 @@ class Tracker:
                 and not s.tasks
                 and now - s.last_event_at >= self.idle_after
             ):
-                s.set("idle")
+                s.set("idle", at=s.last_event_at + self.idle_after)
 
     # --- reconciliation
 
@@ -427,13 +463,13 @@ class Tracker:
             s = Session(a.session_id, "idle", started_at=now, last_event_at=now)
             s.last_event = "discovered"
             if a.status == "busy":
-                s.set("running")
+                s.set("running", at=now)
             elif a.status == "waiting":
-                s.set("waiting", "permission")
+                s.set("waiting", "permission", at=now)
             self.sessions[a.session_id] = s
         elif s.state == "ended":
             s.ended_at = None
-            s.set("idle")
+            s.set("idle", at=now)
         s.name, s.kind = a.name or s.name, a.kind or s.kind
         s.cwd = s.cwd or a.cwd
 
@@ -441,7 +477,7 @@ class Tracker:
         if p is None:
             p = next((p for p in s.processes if p.pid is None), None)
         if p is None:
-            p = self._take(s, None, a.pid, "moved", now) or Process(None, a.pid, pane, now)
+            p = self._take(s, None, a.pid, "moved", now)[0] or Process(None, a.pid, pane, now)
             s.processes.append(p)
         p.pid = a.pid
         p.pane = p.pane or pane
@@ -452,10 +488,10 @@ class Tracker:
             return
         if "waiting" in statuses:
             if s.state == "running":
-                s.set("waiting", "permission")
+                s.set("waiting", "permission", at=now)
             return
         # Every process idle: no turn, no prompt on screen and no background work.
         s.tasks = {k: t for k, t in s.tasks.items() if now - t.last_event_at < self.stale_after}
         if s.state == "running" or (s.state == "waiting" and s.reason != "done"):
             s.end_turn()
-            s.set("waiting", "done")
+            s.set("waiting", "done", at=now)

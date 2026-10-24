@@ -61,7 +61,7 @@ After `install-mcp`, any session can use the tools, for example "which sessions 
 
 | Tool | Does |
 | --- | --- |
-| `list_sessions(states?)` | Sessions with state, reason, directory, last event and its age |
+| `list_sessions(states?)` | Sessions with state, reason and when it was entered, directory, last event (raw and in words) and its time, and the session a `/clear` or `/resume` replaced |
 | `get_session(session_id)` | One session in detail: last assistant message, processes and panes, background tasks |
 | `focus_session(session_id)` | Switches the most recently used tmux client to the session's pane |
 | `launch_session(cwd, prompt?, name?)` | Starts a session in a new window of the `claude` tmux session |

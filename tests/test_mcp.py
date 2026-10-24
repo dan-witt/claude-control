@@ -106,6 +106,29 @@ async def test_list_sessions_defaults_to_live_sessions(tracker):
 
 
 @pytest.mark.anyio
+async def test_list_sessions_board_fields(tracker):
+    rows = structured(await call(server(tracker), "list_sessions"))
+    a = rows[0]
+    assert a["state_since"] == "1970-01-12T13:46:43.000+00:00"  # PermissionRequest at T0 + 3
+    assert a["last_event"] == "PermissionRequest Bash"
+    assert a["last_event_text"] == "asking to use Bash"
+    assert a["last_event_at"] == "1970-01-12T13:46:43.000+00:00"
+    assert a["replaces"] is None
+
+
+def test_describe_events():
+    describe = mcp_server.describe
+    assert describe("PreToolUse Bash") == "running Bash"
+    assert describe("PostToolUseFailure Read") == "ran Read (failed)"
+    assert describe("PermissionRequest AskUserQuestion") == "asking a question"
+    assert describe("PermissionRequest Bash") == "asking to use Bash"
+    assert describe("Stop") == "finished its turn"
+    assert describe("SessionEnd other") == "ended (other)"
+    assert describe("task notification") == "background task reported"
+    assert describe("Something New") == "Something New"
+
+
+@pytest.mark.anyio
 async def test_list_sessions_filters_by_state(tracker):
     rows = structured(await call(server(tracker), "list_sessions", states=["waiting"]))
     assert [r["session_id"] for r in rows] == ["aaaa-1111"]

@@ -155,6 +155,60 @@ def test_clear_ends_old_session_and_moves_process():
     assert r.at(9, "0dbf") == ("ended", "prompt_input_exit")
 
 
+F137 = "f13725cd-0d8f-47eb-ae0c-f029612b6fd8"
+
+
+def test_state_since_changes_with_state_or_reason_only():
+    r = Replay("clear")
+    assert r.to(0).s("f137").state_since == T0  # SessionStart: idle
+    r.to(3)  # PermissionRequest at 7.2
+    assert r.s("f137").state_since == T0 + 7.2
+    r.to(4)  # permission_prompt at 13.2 keeps waiting/permission
+    assert r.s("f137").state_since == T0 + 7.2
+    r.to(5)  # running at 14.3
+    assert r.s("f137").state_since == T0 + 14.3
+
+
+def test_state_since_moves_on_reason_change_and_on_tick():
+    r = Replay("walkthrough").to(18)  # Stop at 104.0: waiting/done
+    s = r.s("e7cb")
+    assert (s.state, s.reason, s.state_since) == ("waiting", "done", T0 + 104.0)
+    r.tracker.tick(T0 + 104.0 + 3600)  # e.g. the first tick after a daemon restart
+    assert (s.state, s.state_since) == ("idle", T0 + 104.0 + 600)
+
+
+def test_clear_records_the_replaced_session():
+    r = Replay("clear").to(8)
+    assert r.s("0dbf").replaces == F137
+    assert r.s("f137").replaces is None
+
+
+def test_clear_records_the_replaced_session_when_session_end_was_lost():
+    r = Replay("clear")
+    for i, e in enumerate(r.events[:9]):
+        if i != 7:
+            r.tracker.apply(e)
+    assert r.s("0dbf").replaces == F137
+    assert r.s("f137").state == "ended"
+
+
+def test_resume_into_a_live_session_records_the_replaced_session():
+    r = Replay("walkthrough").to(70)
+    assert r.s("2be0").replaces == r.s("e7cb").session_id
+
+
+def test_new_session_in_the_same_pane_after_exit_replaces_nothing():
+    r = Replay("clear").to(9)  # 0dbf exits normally
+    e = Event.parse(
+        T0 + 30,
+        {"session_id": "new-1", "hook_event_name": "SessionStart", "source": "startup"},
+        {"x-tmux-pane": "%0", "x-claude-pid": "1309999"},
+    )
+    assert e is not None
+    r.tracker.apply(e)
+    assert r.s("new-1").replaces is None
+
+
 def test_plan_approval_is_a_permission_wait():
     r = Replay("plan_approval")
     assert r.at(10, "4122") == ("waiting", "permission")

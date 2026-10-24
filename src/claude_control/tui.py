@@ -38,41 +38,6 @@ STATE_STYLE = {
     ("ended", None): "dim",
 }
 
-WORDS = {
-    "prompt": "got a prompt",
-    "task notification": "background task reported",
-    "discovered": "found running",
-    "Stop": "finished its turn",
-    "StopFailure": "turn failed",
-    "Notification idle_prompt": "waiting for input",
-    "Notification permission_prompt": "asking permission",
-    "SessionStart startup": "started",
-    "SessionStart resume": "resumed",
-    "SessionStart clear": "cleared",
-    "SessionStart compact": "compacted",
-    "SessionStart fork": "forked",
-    "launched": "launching",
-    "waiting at startup": "waiting at startup (folder trust?)",
-}
-
-
-def describe(last_event: str) -> str:
-    """A session's last event in words."""
-    if last_event in WORDS:
-        return WORDS[last_event]
-    name, _, detail = last_event.partition(" ")
-    if name == "PreToolUse":
-        return f"running {detail}"
-    if name in ("PostToolUse", "PostToolUseFailure"):
-        return f"ran {detail}" + (" (failed)" if name == "PostToolUseFailure" else "")
-    if name == "PermissionRequest":
-        return "asking a question" if detail == "AskUserQuestion" else f"asking to use {detail}"
-    if name == "StopFailure":
-        return f"turn failed ({detail})"
-    if name == "SessionEnd":
-        return f"ended ({detail})" if detail else "ended"
-    return last_event
-
 
 def clip(text: str, width: int) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
@@ -399,7 +364,7 @@ class SessionsApp(App):
                 clip(r.get("name") or r["session_id"][:8], NAME_WIDTH),
                 short_cwd(r.get("cwd")),
                 badge(r["state"], r.get("reason")),
-                describe(r.get("last_event") or ""),
+                r.get("last_event_text") or "",
                 age(r.get("last_event_age_s", 0)),
                 key=r["session_id"],
             )

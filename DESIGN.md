@@ -60,7 +60,7 @@ Background (`--bg`) sessions are listed, view-only.
 
 - Primary key: `session_id`. Each session holds a set of attached processes `{socket, pid, tmux_pane}`; in-memory maps `socket → session_id`, `pid → session_id` and `pane → session_id` resolve lookups.
 - One `session_id` can have several processes: `claude --resume` of the same session in two terminals runs two pids with one id. `focus_session` picks the process with the most recent hook event.
-- `/clear` and in-session `/resume`: the old `session_id` gets `SessionEnd` (reason `clear` / `resume`) and the same process starts a new or other `session_id`; the process moves to it.
+- `/clear` and in-session `/resume`: the old `session_id` gets `SessionEnd` (reason `clear` / `resume`) and the same process starts a new or other `session_id`; the process moves to it. The new session records the old one as `replaces`.
 - Background tasks belong to the session that launched them and do not have their own sessions. A task opens on the `PostToolUse` that launched it: `Agent` with `tool_response.status: "async_launched"` (id `tool_response.agentId`), or `Bash` with `tool_response.backgroundTaskId`. It closes on a `UserPromptSubmit` whose `prompt` is a `<task-notification>` with that `task-id`. Tool events from a fork carry its id as `agent_id` (plus `agent_type: fork`) under the parent's `session_id` and socket. A fork the user starts from the UI has no launching `PostToolUse`; it is known from its first event with an unseen `agent_id`.
 
 States follow the main agent only; events with an `agent_id` update background activity and never change the state.
@@ -95,10 +95,17 @@ Activity: main-agent tool calls are tracked as a set of open `tool_use_id`s (`Pr
 
 | Tool | Does |
 | --- | --- |
-| `list_sessions(states?)` | Sessions oldest first: `session_id`, `name`, `state`, `reason`, `cwd`, `last_event`, `last_event_age_s`, `started_at`, `pane`, `current_tool`, `tool_count`, `background_tasks`. Without `states`, every session that has not ended; an unknown state name is an error. |
+| `list_sessions(states?)` | Sessions oldest first: `session_id`, `name`, `state`, `reason`, `state_since`, `cwd`, `last_event`, `last_event_text`, `last_event_at`, `last_event_age_s`, `started_at`, `pane`, `current_tool`, `tool_count`, `background_tasks`, `replaces`. Without `states`, every session that has not ended; an unknown state name is an error. |
 | `get_session(session_id)` | One session: the list fields plus `message` (last assistant message or notification text), `permission_tool`, `processes` (pid, pane), `tasks` (open background tasks), `ended_at` |
 | `focus_session(session_id)` | `tmux switch-client -c <client> -t <pane>` on the client with the latest `client_activity`, to the pane of the session's most recently active process. Errors: session ended, not in tmux, no client attached. |
 | `launch_session(cwd, prompt?, name?)` | New window in the `claude` tmux session (created, with its server in its own scope, if missing); returns `session_id`, `name`, `pane` and `state: starting`. `cwd` must be an existing absolute directory (`~` expands); `name` defaults to the cwd basename plus two hex digits and must not match a live session. No free-form CLI arguments. |
+
+Session fields added for the status board ([ECH-18](https://linear.app/echowire/issue/ECH-18)):
+
+- `state_since`: when the session entered its current state and reason (ISO 8601, milliseconds). Any change of `state` or `reason` resets it; an event that leaves both unchanged does not.
+- `last_event_at`: time of the last event (ISO 8601, milliseconds); `last_event_age_s` stays.
+- `last_event`: the raw event (`PreToolUse Bash`, `Stop`, `SessionStart clear`); `last_event_text` is the same in words (`running Bash`, `finished its turn`, `cleared`), for display. Clients show `last_event_text` rather than wording `last_event` themselves.
+- `replaces`: the `session_id` this session replaced on the same process through `/clear` or in-session `/resume`, or null. Set on the new session's `SessionStart` (source `clear` or `resume`) from the process that the old session's `SessionEnd` (reason `clear` or `resume`) released, matched by socket, pid or pane; also set when that `SessionEnd` was lost and the process is taken from the old session directly. A resume into a session that is already live elsewhere sets it too, on that session.
 
 `session_id` arguments accept the full id, a session's name (from `claude agents`), or a unique id prefix of at least 4 characters.
 

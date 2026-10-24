@@ -13,7 +13,6 @@ from claude_control.tui import (
     PathSuggester,
     SessionsApp,
     age,
-    describe,
     short_cwd,
 )
 
@@ -26,6 +25,7 @@ def row(sid, name, state, reason=None, **kw):
         "reason": reason,
         "cwd": f"/w/{name}",
         "last_event": "Stop",
+        "last_event_text": "finished its turn",
         "last_event_age_s": 30,
         "current_tool": None,
         "tool_count": 0,
@@ -188,17 +188,6 @@ def test_activity_from_tool_count_changes():
     assert app.is_active(first, now=100.0) is True
     assert app.is_active(first, now=103.5) is False
     assert app.is_active(row("s9", "x", "running", current_tool="Bash"), now=200.0) is True
-
-
-def test_describe_events():
-    assert describe("PreToolUse Bash") == "running Bash"
-    assert describe("PostToolUseFailure Read") == "ran Read (failed)"
-    assert describe("PermissionRequest AskUserQuestion") == "asking a question"
-    assert describe("PermissionRequest Bash") == "asking to use Bash"
-    assert describe("Stop") == "finished its turn"
-    assert describe("SessionEnd other") == "ended (other)"
-    assert describe("task notification") == "background task reported"
-    assert describe("Something New") == "Something New"
 
 
 def test_short_cwd_and_age():
