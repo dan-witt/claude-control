@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 from starlette.testclient import TestClient
@@ -87,3 +88,50 @@ def test_warns_when_handling_reaches_hook_timeout(store, caplog):
 def test_no_warning_for_fast_request(client, caplog):
     post(client, {"session_id": "s1", "hook_event_name": "Stop"})
     assert not [r for r in caplog.records if r.name == "claude_control.app"]
+
+
+def test_hook_updates_session_state(client):
+    sid = "s-state"
+    post(
+        client,
+        {"session_id": sid, "hook_event_name": "SessionStart", "source": "startup"},
+        **{"x-tmux-pane": "%4", "x-claude-pid": "42"},
+    )
+    post(client, {"session_id": sid, "hook_event_name": "UserPromptSubmit", "prompt": "hi"})
+    [s] = client.get("/sessions").json()
+    assert (s["session_id"], s["state"], s["last_event"]) == (sid, "running", "prompt")
+    assert s["processes"] == [{"pid": 42, "pane": "%4", "socket": None}]
+
+
+def test_sessions_hides_ended_unless_asked(client):
+    post(client, {"session_id": "gone", "hook_event_name": "SessionStart", "source": "startup"})
+    post(client, {"session_id": "gone", "hook_event_name": "SessionEnd", "reason": "other"})
+    assert client.get("/sessions").json() == []
+    [s] = client.get("/sessions?ended=1").json()
+    assert (s["state"], s["reason"]) == ("ended", "other")
+
+
+def test_startup_replays_stored_events(store):
+    payload = {"session_id": "old", "hook_event_name": "Stop"}
+    store.append(json.dumps(payload), "old", "Stop", None, {})
+    with TestClient(create_app(store), base_url="http://127.0.0.1:7777") as c:
+        [s] = c.get("/sessions").json()
+    assert (s["session_id"], s["state"], s["reason"]) == ("old", "waiting", "done")
+
+
+def test_reconcile_loop_applies_listing(store):
+    from claude_control.state import Agent
+
+    async def listing():
+        return [Agent(77, "listed", "busy", name="w-2")], {77: "%9"}
+
+    app = create_app(store, listing=listing, reconcile_interval_s=0.05)
+    rows = []
+    with TestClient(app, base_url="http://127.0.0.1:7777") as c:
+        for _ in range(100):
+            rows = c.get("/sessions").json()
+            if rows:
+                break
+            time.sleep(0.02)
+    [s] = rows
+    assert (s["state"], s["name"], s["processes"][0]["pane"]) == ("running", "w-2", "%9")

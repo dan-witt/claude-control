@@ -16,7 +16,7 @@ Out: calendar, tasks, the board UI, voice. No tool sends input to a session (no 
 - Python + uv. One Starlette app serves `/hooks` and `/mcp` (streamable HTTP, official `mcp` SDK) on `127.0.0.1:7777` (configurable). TUI in Textual.
 - Packaged as `claude-control`, installed with `uv tool install`. Subcommands: `serve`, `tui`, `install-hooks`, `install-service`.
 - systemd **user** unit written by `install-service` to `~/.config/systemd/user/claude-control.service`, `Restart=on-failure`, no linger. A user unit, not a system unit, because launched Claude sessions need the desktop session's environment (`SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `DISPLAY`, `GPG_AGENT_INFO`), which the user manager carries and a system service does not.
-- Config: `$XDG_CONFIG_HOME/claude-control/config.toml`. State: SQLite under `$XDG_STATE_HOME/claude-control/` with a sessions table and an events table; events older than 14 days are pruned.
+- Config: `$XDG_CONFIG_HOME/claude-control/config.toml`. State: SQLite under `$XDG_STATE_HOME/claude-control/` holding the event log; events older than 14 days are pruned. Session state lives in memory: at startup the daemon replays the last 24 hours of events (`replay_hours`), then reconciles. Ended sessions are dropped from memory after the same window.
 - Tooling: pytest, ruff, pyright.
 
 ## Security
@@ -24,6 +24,7 @@ Out: calendar, tasks, the board UI, voice. No tool sends input to a session (no 
 - Bind `127.0.0.1` only.
 - `/mcp`: bearer token from `$XDG_CONFIG_HOME/claude-control/token` (mode 0600, generated on first run), plus `Host`/`Origin` must be localhost. `launch_session` runs Claude with an arbitrary prompt, so a web page reaching localhost must not be able to call it.
 - `/hooks`: no token. Requires `Content-Type: application/json` (forces a CORS preflight) and a localhost `Host` (blocks DNS rebinding). This check may be dropped if it breaks hook delivery.
+- `GET /sessions`: read-only JSON of the session state for `claude-control sessions`; localhost `Host` only, no token. Other local users can read it, as they can post to `/hooks`. The MCP resource replaces it as the interface for other components.
 
 ## Intake
 
@@ -45,7 +46,12 @@ Running sessions pick up settings changes without a restart.
 Reconciliation: at startup and every 15s the daemon runs `claude agents --json` (documented CLI; ~0.12s wall, ~0.14s CPU per call). The underlying `~/.claude/sessions/*.json` registry is undocumented and not read directly; it keeps entries for killed processes. Reconciliation:
 - discovers sessions started before the daemon (they post nothing until their next prompt);
 - marks a process ended when its pid disappears (kill -9, a closed terminal that sent no `SessionEnd`);
-- reads each process's `status` (`busy`/`idle`). This is the only signal that a turn ended by interrupt or permission denial, which fire no hook. `busy` also covers background work (forks, background shells) after the main agent's `Stop`, so while background work runs a missed turn end is not detectable this way;
+- reads each process's `status`: `busy` (a turn or background work: forks, background shells), `waiting` (a permission or question prompt is on screen) or `idle` (none of these). This is the only prompt-free signal that a turn ended by interrupt or permission denial, which fire no hook. While background work keeps a process `busy`, a missed turn end is not detectable this way. Status rules apply only to sessions whose last main-agent event is older than 15s, because the listing can lag hooks:
+  - `idle`: a `running` session, or one `waiting` for permission or input, becomes `waiting/done`; open background tasks are closed.
+  - `waiting`: a `running` session becomes `waiting/permission` (the `PermissionRequest` was missed).
+  - `busy`: no change.
+- creates sessions it has not seen (`busy` → `running`, `waiting` → `waiting/permission`, `idle` → `idle`) and revives an ended session that is listed again; a pid listed under another session moves there;
+- ends a session when none of its processes is listed. A process first seen less than 15s ago and never listed is kept, since a new process can post `SessionStart` before it appears;
 - finds the tmux pane of a discovered process: walk its parent pids up to one that is a pane's `#{pane_pid}` in `tmux list-panes -a`. This covers both `claude` started from a pane's shell and `claude` as the pane's own process. A chain that reaches pid 1 without a match is a session outside tmux.
 
 Background (`--bg`) sessions are listed, view-only.
@@ -62,13 +68,18 @@ States follow the main agent only; events with an `agent_id` update background a
 | State | Set by |
 | --- | --- |
 | `starting` | `launch_session`, until `SessionStart` arrives; `error` with reason `launch_timeout` after ~15s |
+| `idle` (new) | `SessionStart` of a new session, which sits at an empty prompt; `compact` and a second `resume` of a live session keep the state |
 | `running` | `UserPromptSubmit` (typed, queued mid-turn, or a `<task-notification>`; no `Stop` need precede it), or main-agent tool activity after a wait |
-| `waiting` | reason `permission` (`PermissionRequest`, including `ExitPlanMode`), `input` (`PermissionRequest` for `AskUserQuestion`, `Notification` `idle_prompt` / `agent_needs_input` / elicitation), `done` (`Stop`). `Notification` `permission_prompt` sets `permission` only while a `PermissionRequest` is outstanding. |
+| `waiting` | reason `permission` (`PermissionRequest`, including `ExitPlanMode`), `input` (`PermissionRequest` for `AskUserQuestion`, `Notification` `agent_needs_input` / `elicitation_dialog`), `done` (`Stop`). `Notification` `permission_prompt` changes nothing. `Notification` `idle_prompt` is not sent while a prompt is open, so it moves `running` (interrupted turn) and `waiting/permission`/`input` (dismissed prompt) to `waiting/done` and clears open tool calls. |
 | `idle` | `waiting/done` with no event for 10 min |
 | `error` | `StopFailure` |
 | `ended` | `SessionEnd`, or pid gone at reconciliation |
 
-A `PermissionRequest` can come from a hook-driven MCP call with nothing on screen; it stays `waiting/permission` until the next main-agent event or `idle_prompt`.
+A `PermissionRequest` can come from a hook-driven MCP call with nothing on screen; it stays `waiting/permission` until the next main-agent event, `idle_prompt`, or reconciliation sees `idle`.
+
+The first event of a session the daemon has not seen (started before the daemon, or older than the replay window) creates it as `running`, unless the event sets another state.
+
+Processes are matched to events by socket, then pid, then pane; a process known only by pid (from reconciliation) is taken over by the first event carrying a socket.
 
 Activity: main-agent tool calls are tracked as a set of open `tool_use_id`s (`PreToolUse` adds, `PostToolUse`/`PostToolUseFailure` removes) plus a counter. Parallel calls overlap and finish out of order. `current_tool` is the most recently opened call still open. Background activity is the set of open background tasks and the time of the last event from each fork. The TUI shows a spinner while a main-agent call is open or the counter changed in the last few seconds, and a separate background indicator while tasks are open. `PreToolUse` for a call can precede its execution by up to a minute when the model emits several calls in one response; the spinner shows activity during that time, when the model is generating.
 
@@ -149,6 +160,8 @@ From test sessions in a separate tmux server (Haiku) with every documented hook 
 | Daemon frozen (SIGSTOP) | Short turn 2.5–4s → 10.8–11.8s. Requests queued in the socket were processed on resume with that time as `received_at` | Never block the request path; `received_at` is arrival, not event time |
 | Daemon stopped | No slowdown; events lost; UI shows "Stop hook error occurred" | |
 | Keep-alive race | A `Stop` sent 5.0s after the previous request on the same connection failed with `socket hang up` (uvicorn's idle timeout is 5s); the next request opened a new connection | Fixed by `Connection: close` |
+| Permission prompt left open (Haiku, `--permission-mode default`) | `claude agents` `status: waiting` for the whole 92s; no `idle_prompt`. After Esc: `status: idle` within 5s, `idle_prompt` 61s later | `waiting` and `idle` statuses drive reconciliation |
+| `--bg` session row | `claude agents` rows for `kind: background` also carry `id` and `state` (`blocked` observed while `status: idle`) | Not used |
 | Pane lookup for a discovered pid | Parent-pid walk to `#{pane_pid}` matched the `X-Tmux-Pane` from `SessionStart` for `claude` started from a pane's shell and for `claude` as the pane process | |
 
 Request details: `content-type: application/json`, `host: 127.0.0.1:<port>`, `user-agent: axios/…`. `X-Tmux-Pane` resolves on every hook; `X-Claude-Pid` equals the claude pid; `claude agents --json` names are per process and change on resume (`live-b0` → `live-b4`, `live-8c`).

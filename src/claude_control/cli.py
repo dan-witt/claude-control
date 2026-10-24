@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import time
+import urllib.request
 from pathlib import Path
 
 from . import config, hooks_install, service_install
@@ -11,10 +12,16 @@ from .store import EventStore
 def cmd_serve(args: argparse.Namespace, cfg: config.Config) -> None:
     import uvicorn
 
-    from .app import create_app
+    from .app import create_app, system_listing
 
     store = EventStore(cfg.db_path)
-    app = create_app(store, retention_days=cfg.retention_days)
+    app = create_app(
+        store,
+        retention_days=cfg.retention_days,
+        replay_hours=cfg.replay_hours,
+        listing=system_listing(cfg.claude_bin),
+        reconcile_interval_s=cfg.reconcile_interval_s,
+    )
     uvicorn.run(app, host=cfg.host, port=cfg.port, log_level=args.log_level)
 
 
@@ -53,6 +60,37 @@ def cmd_events(args: argparse.Namespace, cfg: config.Config) -> None:
         print(f"{stamp} {e.session_id} {e.tmux_pane or '-':>5} {e.event} {detail}")
 
 
+def _age(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def cmd_sessions(args: argparse.Namespace, cfg: config.Config) -> None:
+    url = f"http://{cfg.host}:{cfg.port}/sessions" + ("?ended=1" if args.all else "")
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            sessions = json.load(r)
+    except OSError as e:
+        raise SystemExit(f"daemon not reachable at {url}: {e}") from e
+    if args.json:
+        print(json.dumps(sessions, indent=2))
+        return
+    now = time.time()
+    for s in sessions:
+        state = s["state"] + (f"/{s['reason']}" if s["reason"] else "")
+        panes = ",".join(p["pane"] for p in s["processes"] if p["pane"]) or "-"
+        tasks = f" +{len(s['tasks'])} bg" if s["tasks"] else ""
+        tool = f" [{s['current_tool']}]" if s["current_tool"] else ""
+        label = (s["name"] or s["session_id"][:8])[:28]
+        print(
+            f"{state:<20} {label:<28} {panes:<6} {_age(now - s['last_event_at']):>5}"
+            f" {s['last_event']}{tool}{tasks}  {s['cwd'] or ''}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="claude-control")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -69,6 +107,11 @@ def main() -> None:
     p = sub.add_parser("install-service", help="install and start the systemd user unit")
     p.add_argument("--no-start", action="store_true")
     p.set_defaults(func=cmd_install_service)
+
+    p = sub.add_parser("sessions", help="print the daemon's session state")
+    p.add_argument("-a", "--all", action="store_true", help="include ended sessions")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_sessions)
 
     p = sub.add_parser("events", help="print recently received hook events")
     p.add_argument("-n", "--limit", type=int, default=50)

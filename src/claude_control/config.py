@@ -24,6 +24,9 @@ class Config:
     host: str = "127.0.0.1"
     port: int = 7777
     retention_days: int = 14
+    replay_hours: int = 24
+    reconcile_interval_s: float = 15
+    claude_bin: str = "claude"
 
     @property
     def hooks_url(self) -> str:

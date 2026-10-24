@@ -76,5 +76,13 @@ class EventStore:
         rows = self._db.execute(sql, (*args, limit)).fetchall()
         return [Event(r[0], r[1], r[2], r[3], r[4], json.loads(r[5]), r[6]) for r in reversed(rows)]
 
+    def since(self, received_after: float) -> list[Event]:
+        rows = self._db.execute(
+            "SELECT id, received_at, session_id, event, tmux_pane, headers, payload FROM events"
+            " WHERE received_at >= ? ORDER BY id",
+            (received_after,),
+        ).fetchall()
+        return [Event(r[0], r[1], r[2], r[3], r[4], json.loads(r[5]), r[6]) for r in rows]
+
     def close(self) -> None:
         self._db.close()
