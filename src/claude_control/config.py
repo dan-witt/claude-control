@@ -1,4 +1,5 @@
 import os
+import secrets
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,28 @@ class Config:
     @property
     def db_path(self) -> Path:
         return state_dir() / "events.db"
+
+
+def token_path() -> Path:
+    return config_dir() / "token"
+
+
+def ensure_token() -> str:
+    """Bearer token for /mcp, generated on first use (mode 0600)."""
+    path = token_path()
+    try:
+        return path.read_text().strip()
+    except FileNotFoundError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_urlsafe(32)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return path.read_text().strip()
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
+    return token
 
 
 def load() -> Config:

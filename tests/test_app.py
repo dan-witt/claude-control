@@ -7,6 +7,8 @@ from starlette.testclient import TestClient
 from claude_control.app import create_app
 from claude_control.store import EventStore
 
+TOKEN = "test-token"
+
 
 @pytest.fixture
 def store(tmp_path):
@@ -17,7 +19,7 @@ def store(tmp_path):
 
 @pytest.fixture
 def client(store):
-    with TestClient(create_app(store), base_url="http://127.0.0.1:7777") as c:
+    with TestClient(create_app(store, token=TOKEN), base_url="http://127.0.0.1:7777") as c:
         yield c
 
 
@@ -78,7 +80,9 @@ def test_prune(store):
 
 
 def test_warns_when_handling_reaches_hook_timeout(store, caplog):
-    with TestClient(create_app(store, slow_after_s=0), base_url="http://127.0.0.1:7777") as c:
+    with TestClient(
+        create_app(store, token=TOKEN, slow_after_s=0), base_url="http://127.0.0.1:7777"
+    ) as c:
         post(c, {"session_id": "s1", "hook_event_name": "Stop"})
     [record] = [r for r in caplog.records if r.name == "claude_control.app"]
     assert record.levelname == "WARNING"
@@ -114,7 +118,7 @@ def test_sessions_hides_ended_unless_asked(client):
 def test_startup_replays_stored_events(store):
     payload = {"session_id": "old", "hook_event_name": "Stop"}
     store.append(json.dumps(payload), "old", "Stop", None, {})
-    with TestClient(create_app(store), base_url="http://127.0.0.1:7777") as c:
+    with TestClient(create_app(store, token=TOKEN), base_url="http://127.0.0.1:7777") as c:
         [s] = c.get("/sessions").json()
     assert (s["session_id"], s["state"], s["reason"]) == ("old", "waiting", "done")
 
@@ -125,7 +129,7 @@ def test_reconcile_loop_applies_listing(store):
     async def listing():
         return [Agent(77, "listed", "busy", name="w-2")], {77: "%9"}
 
-    app = create_app(store, listing=listing, reconcile_interval_s=0.05)
+    app = create_app(store, token=TOKEN, listing=listing, reconcile_interval_s=0.05)
     rows = []
     with TestClient(app, base_url="http://127.0.0.1:7777") as c:
         for _ in range(100):

@@ -13,8 +13,8 @@ Out: calendar, tasks, the board UI, voice. No tool sends input to a session (no 
 
 ## Runtime
 
-- Python + uv. One Starlette app serves `/hooks` and `/mcp` (streamable HTTP, official `mcp` SDK) on `127.0.0.1:7777` (configurable). TUI in Textual.
-- Packaged as `claude-control`, installed with `uv tool install`. Subcommands: `serve`, `tui`, `install-hooks`, `install-service`.
+- Python + uv. One Starlette app serves `/hooks` and `/mcp` (streamable HTTP, official `mcp` SDK 2.x, `MCPServer`) on `127.0.0.1:7777` (configurable). TUI in Textual.
+- Packaged as `claude-control`, installed with `uv tool install`. Subcommands: `serve`, `tui`, `install-hooks`, `install-service`, `install-mcp`, `sessions`, `events`. A new dependency needs `uv tool install --editable . --force`; the service fails to start without it.
 - systemd **user** unit written by `install-service` to `~/.config/systemd/user/claude-control.service`, `Restart=on-failure`, no linger. A user unit, not a system unit, because launched Claude sessions need the desktop session's environment (`SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `DISPLAY`, `GPG_AGENT_INFO`), which the user manager carries and a system service does not.
 - Config: `$XDG_CONFIG_HOME/claude-control/config.toml`. State: SQLite under `$XDG_STATE_HOME/claude-control/` holding the event log; events older than 14 days are pruned. Session state lives in memory: at startup the daemon replays the last 24 hours of events (`replay_hours`), then reconciles. Ended sessions are dropped from memory after the same window.
 - Tooling: pytest, ruff, pyright.
@@ -22,7 +22,7 @@ Out: calendar, tasks, the board UI, voice. No tool sends input to a session (no 
 ## Security
 
 - Bind `127.0.0.1` only.
-- `/mcp`: bearer token from `$XDG_CONFIG_HOME/claude-control/token` (mode 0600, generated on first run), plus `Host`/`Origin` must be localhost. `launch_session` runs Claude with an arbitrary prompt, so a web page reaching localhost must not be able to call it.
+- `/mcp`: bearer token from `$XDG_CONFIG_HOME/claude-control/token` (mode 0600, generated on first run), checked by the daemon (the SDK's own auth support is OAuth-shaped); the SDK checks `Host`/`Origin` are localhost. `launch_session` runs Claude with an arbitrary prompt, so a web page reaching localhost must not be able to call it. `install-mcp` registers the endpoint with Claude Code at user scope (`claude mcp add --transport http`), which stores the token in `~/.claude.json`.
 - `/hooks`: no token. Requires `Content-Type: application/json` (forces a CORS preflight) and a localhost `Host` (blocks DNS rebinding). This check may be dropped if it breaks hook delivery.
 - `GET /sessions`: read-only JSON of the session state for `claude-control sessions`; localhost `Host` only, no token. Other local users can read it, as they can post to `/hooks`. The MCP resource replaces it as the interface for other components.
 
@@ -95,12 +95,14 @@ Activity: main-agent tool calls are tracked as a set of open `tool_use_id`s (`Pr
 
 | Tool | Does |
 | --- | --- |
-| `list_sessions(states?)` | Sessions with state, reason, last event, age, cwd, name |
-| `get_session(session_id)` | One session: last assistant message or notification text, processes, panes, tool counter, current tool, open background tasks |
-| `focus_session(session_id)` | Switches the most recent tmux client to the session's pane |
+| `list_sessions(states?)` | Sessions oldest first: `session_id`, `name`, `state`, `reason`, `cwd`, `last_event`, `last_event_age_s`, `started_at`, `pane`, `current_tool`, `background_tasks`. Without `states`, every session that has not ended; an unknown state name is an error. |
+| `get_session(session_id)` | One session: the list fields plus `message` (last assistant message or notification text), `tool_count`, `permission_tool`, `processes` (pid, pane), `tasks` (open background tasks), `ended_at` |
+| `focus_session(session_id)` | `tmux switch-client -c <client> -t <pane>` on the client with the latest `client_activity`, to the pane of the session's most recently active process. Errors: session ended, not in tmux, no client attached. |
 | `launch_session(cwd, prompt?, name?)` | New window in the `claude` tmux session; returns the pre-assigned `session_id` in state `starting`. `cwd` must exist; `name` defaults to the cwd basename plus a short suffix. No free-form CLI arguments. |
 
-Resource: `sessions://` (subscribable; the TUI uses it for live updates).
+`session_id` arguments accept the full id, a session's name (from `claude agents`), or a unique id prefix of at least 4 characters. `launch_session` arrives with milestone 5.
+
+Resource: `sessions://`, JSON of `list_sessions()`. Subscribers are notified (`ResourceUpdated`) when a session is added or removed or its state, reason, name or processes change; tool activity does not notify. Notifications use the 2026-07-28 `subscriptions/listen` stream; clients on earlier protocol versions (`resources/subscribe`) can read the resource but get no notifications.
 
 ## TUI
 

@@ -20,6 +20,7 @@ class Process:
     pane: str | None
     first_seen: float
     listed: bool = False  # seen in `claude agents`
+    last_event_at: float = 0.0
 
 
 @dataclass
@@ -78,6 +79,12 @@ class Session:
     @property
     def current_tool(self) -> str | None:
         return next(reversed(self.open_tools.values()), None)
+
+    @property
+    def focus_pane(self) -> str | None:
+        """Pane of the process with the most recent hook event."""
+        panes = [p for p in self.processes if p.pane]
+        return max(panes, key=lambda p: p.last_event_at).pane if panes else None
 
     def set(self, state: str, reason: str | None = None) -> None:
         self.state, self.reason = state, reason
@@ -208,6 +215,7 @@ class Tracker:
         p.socket = p.socket or e.socket
         p.pid = p.pid or e.pid
         p.pane = p.pane or e.pane
+        p.last_event_at = e.received_at
 
     def _take(
         self, s: Session, socket: str | None, pid: int | None, reason: str, at: float
@@ -306,6 +314,24 @@ class Tracker:
             s.processes.remove(p)
         if not s.processes and s.state != "ended":
             self._end(s, e.payload.get("reason"), e.received_at)
+
+    def signature(self) -> tuple:
+        """Changes when a session is added or removed, or its state or processes change.
+
+        Tool activity does not change it; resource subscribers are notified on changes.
+        """
+        return tuple(
+            sorted(
+                (
+                    s.session_id,
+                    s.state,
+                    s.reason,
+                    s.name,
+                    tuple(sorted((p.pid or 0, p.pane or "") for p in s.processes)),
+                )
+                for s in self.sessions.values()
+            )
+        )
 
     def forget_ended(self, ended_before: float) -> None:
         for sid in [

@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import subprocess
 import time
 import urllib.request
 from pathlib import Path
@@ -17,6 +18,7 @@ def cmd_serve(args: argparse.Namespace, cfg: config.Config) -> None:
     store = EventStore(cfg.db_path)
     app = create_app(
         store,
+        token=config.ensure_token(),
         retention_days=cfg.retention_days,
         replay_hours=cfg.replay_hours,
         listing=system_listing(cfg.claude_bin),
@@ -34,6 +36,24 @@ def cmd_install_hooks(args: argparse.Namespace, cfg: config.Config) -> None:
         return
     action = "removed from" if url is None else f"pointing at {url} written to"
     print(f"hooks {action} {path}" + (f" (backup: {backup})" if backup else ""))
+
+
+MCP_NAME = "claude-control"
+
+
+def cmd_install_mcp(args: argparse.Namespace, cfg: config.Config) -> None:
+    """Register the daemon's MCP endpoint with Claude Code at user scope."""
+    claude = cfg.claude_bin
+    remove = [claude, "mcp", "remove", "--scope", "user", MCP_NAME]
+    subprocess.run(remove, check=False, capture_output=True)  # absent is fine
+    if args.uninstall:
+        print(f"removed MCP server {MCP_NAME}")
+        return
+    url = f"http://{cfg.host}:{cfg.port}/mcp"
+    header = f"Authorization: Bearer {config.ensure_token()}"
+    add = [claude, "mcp", "add", "--scope", "user", "--transport", "http", MCP_NAME, url]
+    subprocess.run([*add, "--header", header], check=True, capture_output=True)
+    print(f"registered MCP server {MCP_NAME} at {url} (user scope)")
 
 
 def cmd_install_service(args: argparse.Namespace, cfg: config.Config) -> None:
@@ -103,6 +123,10 @@ def main() -> None:
     p.add_argument("--settings", type=Path)
     p.add_argument("--uninstall", action="store_true")
     p.set_defaults(func=cmd_install_hooks)
+
+    p = sub.add_parser("install-mcp", help="register the MCP endpoint with Claude Code")
+    p.add_argument("--uninstall", action="store_true")
+    p.set_defaults(func=cmd_install_mcp)
 
     p = sub.add_parser("install-service", help="install and start the systemd user unit")
     p.add_argument("--no-start", action="store_true")

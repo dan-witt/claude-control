@@ -2,17 +2,21 @@ import asyncio
 import contextlib
 import json
 import logging
+import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 
+from mcp.server.subscriptions import InMemorySubscriptionBus, ResourceUpdated
 from starlette.applications import Starlette
+from starlette.datastructures import Headers
 from starlette.middleware import Middleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
-from starlette.routing import Route
+from starlette.routing import Mount, Route
+from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import reconcile
+from . import mcp_server, reconcile, tmux
 from .events import Event
 from .hooks_install import TIMEOUT_S
 from .state import Agent, Tracker
@@ -41,16 +45,47 @@ def system_listing(claude_bin: str) -> Listing:
     return listing
 
 
+class BearerGuard:
+    """Rejects HTTP requests without `Authorization: Bearer <token>`."""
+
+    def __init__(self, app: ASGIApp, token: str):
+        self.app = app
+        self.expected = f"Bearer {token}".encode()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            given = Headers(scope=scope).get("authorization", "").encode()
+            if not secrets.compare_digest(given, self.expected):
+                response = PlainTextResponse(
+                    "unauthorized", status_code=401, headers={"www-authenticate": "Bearer"}
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def create_app(
     store: EventStore,
+    token: str,
     tracker: Tracker | None = None,
     retention_days: int = 14,
     replay_hours: float = 24,
     listing: Listing | None = None,
     reconcile_interval_s: float = 15,
+    focus: mcp_server.Focus = tmux.focus,
     slow_after_s: float = TIMEOUT_S,
 ) -> Starlette:
     tracker = tracker or Tracker()
+    bus = InMemorySubscriptionBus()
+    mcp = mcp_server.build(tracker, bus, focus)
+    mcp_app = mcp.streamable_http_app(streamable_http_path="/mcp")
+    published = [tracker.signature()]
+
+    async def publish_if_changed() -> None:
+        signature = tracker.signature()
+        if signature != published[0]:
+            published[0] = signature
+            await bus.publish(ResourceUpdated(uri=mcp_server.SESSIONS_URI))
 
     async def hooks(request: Request) -> Response:
         started = time.monotonic()
@@ -79,6 +114,7 @@ def create_app(
         if event is not None:
             try:
                 tracker.apply(event)
+                await publish_if_changed()
             except Exception:
                 log.exception("state update failed for %s %s", event.name, event.session_id)
         elapsed = time.monotonic() - started
@@ -128,6 +164,7 @@ def create_app(
             agents, panes = result
             tracker.reconcile(agents, panes, now)
         tracker.tick(now)
+        await publish_if_changed()
 
     @contextlib.asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncIterator[None]:
@@ -149,11 +186,13 @@ def create_app(
                 await asyncio.sleep(reconcile_interval_s)
 
         replay()
+        published[0] = tracker.signature()
         tasks = [asyncio.create_task(prune_loop())]
         if listing is not None:
             tasks.append(asyncio.create_task(reconcile_loop()))
         try:
-            yield
+            async with mcp.session_manager.run():
+                yield
         finally:
             for task in tasks:
                 task.cancel()
@@ -163,6 +202,8 @@ def create_app(
             Route("/hooks", hooks, methods=["POST"]),
             Route("/health", health, methods=["GET"]),
             Route("/sessions", sessions, methods=["GET"]),
+            # The MCP app serves /mcp and checks Host/Origin itself (DNS rebinding).
+            Mount("/", app=BearerGuard(mcp_app, token)),
         ],
         middleware=[Middleware(TrustedHostMiddleware, allowed_hosts=LOCAL_HOSTS)],
         lifespan=lifespan,
