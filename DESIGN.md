@@ -86,17 +86,17 @@ Activity: main-agent tool calls are tracked as a set of open `tool_use_id`s (`Pr
 ## tmux
 
 - tmux is the session host. Sessions outside tmux are tracked and listed but cannot be focused.
-- Launched sessions go into a dedicated tmux session `claude` (configurable), one window per Claude session named after it, the TUI in window 0.
-- The daemon never owns the tmux server. If no server is running it starts one in its own scope: `systemd-run --user --scope --unit=claude-tmux tmux new-session -d -s claude`. A server started inside the daemon's cgroup would be killed, with every Claude session, on `systemctl --user restart claude-control`.
+- Launched sessions go into a dedicated tmux session `claude`, one window per Claude session named after it, the TUI in a window named `tui`.
+- The daemon never owns the tmux server. Whoever starts the server (the `tui` command now, the daemon for `launch_session`) starts it in its own scope: `systemd-run --user --scope --unit=claude-tmux tmux new-session -d -s claude ...`. A server started inside the daemon's cgroup would be killed, with every Claude session, on `systemctl --user restart claude-control`. Verified: the server's cgroup is `app.slice/claude-tmux.scope`, and the scope goes away with the server.
 - A launched window runs `bash -li` in `cwd`; the daemon then types `claude --session-id <uuid> --name <name> "<prompt>"` into it. Claude gets the full `.bashrc` environment (nvm, pyenv, bun), and the pane is left at a shell when Claude exits.
-- Focus: `tmux switch-client` on the most recently active client to the session's pane. No attached client → error. The way back to the TUI is a tmux binding the tool prints (e.g. `bind C-c switch-client -t claude:0`); it does not edit `~/.tmux.conf`.
+- Focus: `tmux switch-client` on the most recently active client to the session's pane. No attached client → error. With tmux 3.4, `switch-client -c <client> -t <pane id>` selects the pane's session, window and pane in one step. The way back to the TUI is a tmux binding documented in the README (`bind C-c switch-client -t claude:tui`); the tool does not edit `~/.tmux.conf`.
 
 ## MCP vocabulary (v1)
 
 | Tool | Does |
 | --- | --- |
-| `list_sessions(states?)` | Sessions oldest first: `session_id`, `name`, `state`, `reason`, `cwd`, `last_event`, `last_event_age_s`, `started_at`, `pane`, `current_tool`, `background_tasks`. Without `states`, every session that has not ended; an unknown state name is an error. |
-| `get_session(session_id)` | One session: the list fields plus `message` (last assistant message or notification text), `tool_count`, `permission_tool`, `processes` (pid, pane), `tasks` (open background tasks), `ended_at` |
+| `list_sessions(states?)` | Sessions oldest first: `session_id`, `name`, `state`, `reason`, `cwd`, `last_event`, `last_event_age_s`, `started_at`, `pane`, `current_tool`, `tool_count`, `background_tasks`. Without `states`, every session that has not ended; an unknown state name is an error. |
+| `get_session(session_id)` | One session: the list fields plus `message` (last assistant message or notification text), `permission_tool`, `processes` (pid, pane), `tasks` (open background tasks), `ended_at` |
 | `focus_session(session_id)` | `tmux switch-client -c <client> -t <pane>` on the client with the latest `client_activity`, to the pane of the session's most recently active process. Errors: session ended, not in tmux, no client attached. |
 | `launch_session(cwd, prompt?, name?)` | New window in the `claude` tmux session; returns the pre-assigned `session_id` in state `starting`. `cwd` must exist; `name` defaults to the cwd basename plus a short suffix. No free-form CLI arguments. |
 
@@ -106,9 +106,11 @@ Resource: `sessions://`, JSON of `list_sessions()`. Subscribers are notified (`R
 
 ## TUI
 
-`claude-control tui`: inside tmux it runs the TUI; outside tmux it asks the daemon to ensure the `claude` tmux session exists, then execs `tmux attach -t claude`.
+`claude-control tui`: inside tmux (or with `--here`) it runs the TUI; outside tmux it makes sure the `claude` tmux session has a `tui` window running `claude-control tui` (starting the server in its own scope, as above), then execs `tmux attach -t claude:tui`. The command does this itself rather than through the daemon: `systemd-run --scope` gives the same isolation from any process, and the daemon needs no extra endpoint.
 
-Rows in fixed order by start time (never re-sorted by urgency): name, shortened cwd, state badge with reason, last event in words, age, activity spinner. Keys: `j`/`k` move, `enter` focus, `n` new session (cwd with path completion, multi-line prompt), `/` filter, `e` toggle ended sessions (hidden by default).
+The TUI is an MCP client of the daemon (`list_sessions`, `focus_session`). It refreshes on `sessions://` notifications and polls every second for tool activity and ages; when the daemon is unreachable it shows one notification and retries.
+
+Rows in fixed order by start time (never re-sorted by urgency): activity spinner (a main-agent tool call is open, or `tool_count` changed in the last 3s), name, shortened cwd, state badge with reason, last event in words, age of the last event. Keys: `j`/`k` move, `enter` focus, `/` filter (name, directory, state; `escape` clears), `e` toggle ended sessions (hidden by default), `q` quit. `n` new session (cwd with path completion, multi-line prompt) comes with milestone 5.
 
 ## Milestones
 

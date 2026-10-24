@@ -1,6 +1,8 @@
 """tmux commands the daemon runs. None of them starts a tmux server."""
 
 import asyncio
+import shlex
+import subprocess
 
 TIMEOUT_S = 5
 
@@ -47,3 +49,39 @@ async def focus(pane: str) -> str:
     client = max(clients)[1]
     await _tmux("switch-client", "-c", client, "-t", pane)
     return client
+
+
+def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, capture_output=True, text=True, check=False)
+
+
+def ensure_window(
+    session: str, window: str, command: list[str], socket: str | None = None
+) -> list[list[str]]:
+    """Make sure tmux session `session` has a window named `window` running `command`.
+
+    A tmux server started here gets its own systemd scope, so it outlives the terminal and
+    is not in any service's cgroup. Returns the commands it ran. `socket` (tmux -L) is for
+    tests.
+    """
+    tmux = ["tmux", *(["-L", socket] if socket else [])]
+    shell_command = shlex.join(command)
+    ran: list[list[str]] = []
+
+    def run(argv: list[str]) -> None:
+        ran.append(argv)
+        result = _run(argv)
+        if result.returncode != 0:
+            raise TmuxError(result.stderr.strip() or f"{argv[0]} failed")
+
+    if _run([*tmux, "has-session", "-t", f"={session}"]).returncode != 0:
+        new = [*tmux, "new-session", "-d", "-s", session, "-n", window, shell_command]
+        server_running = _run([*tmux, "list-sessions"]).returncode == 0
+        if not server_running and socket is None:
+            new = ["systemd-run", "--user", "--scope", "--quiet", "--unit=claude-tmux", *new]
+        run(new)
+        return ran
+    windows = _run([*tmux, "list-windows", "-t", f"={session}", "-F", "#{window_name}"])
+    if window not in windows.stdout.split():
+        run([*tmux, "new-window", "-d", "-t", f"={session}:", "-n", window, shell_command])
+    return ran

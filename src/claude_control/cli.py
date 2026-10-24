@@ -1,7 +1,9 @@
 import argparse
 import json
 import logging
+import os
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -39,6 +41,25 @@ def cmd_install_hooks(args: argparse.Namespace, cfg: config.Config) -> None:
 
 
 MCP_NAME = "claude-control"
+TMUX_SESSION = "claude"
+TUI_WINDOW = "tui"
+
+
+def cmd_tui(args: argparse.Namespace, cfg: config.Config) -> None:
+    if os.environ.get("TMUX") or args.here:
+        from .tui import SessionsApp, mcp_backend
+
+        url = f"http://{cfg.host}:{cfg.port}/mcp"
+        SessionsApp(mcp_backend(url, config.ensure_token())).run()
+        return
+    from . import tmux
+
+    exe = str(Path(sys.argv[0]).absolute())
+    try:
+        tmux.ensure_window(TMUX_SESSION, TUI_WINDOW, [exe, "tui"])
+    except tmux.TmuxError as e:
+        raise SystemExit(f"could not start the tmux session: {e}") from e
+    os.execvp("tmux", ["tmux", "attach-session", "-t", f"={TMUX_SESSION}:{TUI_WINDOW}"])
 
 
 def cmd_install_mcp(args: argparse.Namespace, cfg: config.Config) -> None:
@@ -131,6 +152,10 @@ def main() -> None:
     p = sub.add_parser("install-service", help="install and start the systemd user unit")
     p.add_argument("--no-start", action="store_true")
     p.set_defaults(func=cmd_install_service)
+
+    p = sub.add_parser("tui", help="session list; outside tmux, opens it in the claude session")
+    p.add_argument("--here", action="store_true", help="run in this terminal, not in tmux")
+    p.set_defaults(func=cmd_tui)
 
     p = sub.add_parser("sessions", help="print the daemon's session state")
     p.add_argument("-a", "--all", action="store_true", help="include ended sessions")

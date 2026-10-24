@@ -43,6 +43,7 @@ def summary(s: Session, now: float) -> dict[str, Any]:
         "started_at": _iso(s.started_at),
         "pane": s.focus_pane,
         "current_tool": s.current_tool,
+        "tool_count": s.tool_count,
         "background_tasks": len(s.tasks),
     }
 
@@ -51,7 +52,6 @@ def detail(s: Session, now: float) -> dict[str, Any]:
     return {
         **summary(s, now),
         "message": s.message,
-        "tool_count": s.tool_count,
         "permission_tool": s.permission_tool,
         "processes": [{"pid": p.pid, "pane": p.pane} for p in s.processes],
         "tasks": [

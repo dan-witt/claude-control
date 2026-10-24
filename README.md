@@ -9,6 +9,13 @@ claude-control install-hooks     # adds hooks to ~/.claude/settings.json (backup
 claude-control install-mcp       # registers the MCP endpoint with Claude Code (user scope)
 claude-control events            # recent hook events
 claude-control sessions          # session state as the daemon sees it
+claude-control tui               # session list; enter focuses a session's tmux pane
 ```
 
 Remove the hooks with `claude-control install-hooks --uninstall`.
+
+To get back to the list from a session's pane, add to `~/.tmux.conf`:
+
+```
+bind C-c switch-client -t claude:tui
+```
